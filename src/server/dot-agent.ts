@@ -25,7 +25,9 @@ import { chat, maxIterations } from '@tanstack/ai';
 import { openaiCompatibleText } from '@tanstack/ai-openai/compatible';
 import { learnedSkillTools, tanstackTools } from './tanstack-tools.js';
 import { randomUUID } from 'node:crypto';
-import { Observable, lastValueFrom, toArray } from 'rxjs';
+import { Observable, lastValueFrom, toArray, tap } from 'rxjs';
+import { globalRunCoordinator } from './run-coordinator.js';
+import { ProtocolAccumulator } from './protocol-accumulator.js';
 import { z } from 'zod';
 import { Store } from './store.js';
 import { WorkspaceStore } from './workspace.js';
@@ -134,14 +136,15 @@ export class DotAgent extends AbstractAgent {
           dot.id,
         );
 
-        // One active run per thread
+        // Atomic run ownership & cancellation coordination
         this.workspace.cancelActiveRuns(input.threadId);
+        globalRunCoordinator.register(input.threadId, input.runId, dot.id, controller, this);
 
         // Persist incoming messages before execution
         if (Array.isArray(input.messages)) {
           const existingMessages = this.workspace.getNativeMessages(input.threadId);
           for (const msg of input.messages) {
-            if (msg.role === 'user' || msg.role === 'assistant') {
+            if (msg.role === 'user' || msg.role === 'assistant' || msg.role === 'tool') {
               const text =
                 typeof msg.content === 'string'
                   ? msg.content
@@ -154,6 +157,8 @@ export class DotAgent extends AbstractAgent {
               if (!alreadySaved) {
                 this.workspace.saveMessage(input.threadId, msg.role, text, {
                   id: msg.id,
+                  toolCallId: (msg as any).toolCallId,
+                  toolCalls: (msg as any).toolCalls,
                 });
               }
             }
@@ -389,7 +394,6 @@ export class DotAgent extends AbstractAgent {
         });
         const start = async () => {
           let capturedUserText = '';
-          let assistantResponse = '';
           const appTools =
             this.config.composioApiKey &&
             initialSettings.appsAllowed &&
@@ -437,15 +441,31 @@ export class DotAgent extends AbstractAgent {
               if (target.id === dot.id)
                 throw new Error('Cannot delegate a task to yourself.');
 
+              const subThreadId = `delegation-${runRecord.id}-${randomUUID()}`;
+              this.workspace.bindThread(
+                subThreadId,
+                target.id,
+                `Delegation from ${dot.name}: ${task.slice(0, 30)}`,
+              );
+              this.workspace.saveMessage(subThreadId, 'user', task);
+
               const subRun = this.workspace.createRun({
-                threadId: input.threadId,
+                threadId: subThreadId,
                 dotId: target.id,
-                parentRunId: input.runId || null,
+                parentRunId: runRecord.id,
                 metadata: {
                   delegation: true,
                   fromDotId: dot.id,
                   fromDotName: dot.name,
+                  parentRunId: runRecord.id,
                 },
+              });
+
+              const delegationExec = this.workspace.createToolExecution({
+                runId: runRecord.id,
+                threadId: input.threadId,
+                toolName: 'delegate_task',
+                args: { specialist: target.name, task },
               });
 
               const subAgent = new DotAgent(
@@ -463,46 +483,87 @@ export class DotAgent extends AbstractAgent {
                   status: 'cancelled',
                   finishedAt: Date.now(),
                 });
+                this.workspace.updateToolExecution(delegationExec.id, {
+                  status: 'failed',
+                  error: 'Delegation cancelled',
+                  finishedAt: Date.now(),
+                });
               };
               controller.signal.addEventListener('abort', subAbort, {
                 once: true,
               });
 
               try {
-                const subMessages = [
-                  ...input.messages.filter(
-                    (m) => m.role === 'user' || m.role === 'assistant',
-                  ),
-                  { id: randomUUID(), role: 'user', content: task },
-                ];
-                const events = await lastValueFrom(
+                const subAccumulator = new ProtocolAccumulator();
+                await lastValueFrom(
                   subAgent
                     .run({
-                      ...input,
                       runId: subRun.id,
-                      messages: subMessages as any,
+                      threadId: subThreadId,
+                      messages: [{ id: randomUUID(), role: 'user', content: task }] as any,
+                      tools: [],
+                      context: [],
+                      state: {},
+                      forwardedProps: {},
                     })
-                    .pipe(toArray()),
+                    .pipe(
+                      tap((ev) => subAccumulator.processEvent(ev)),
+                      toArray(),
+                    ),
                 );
-                let text = '';
-                for (const ev of events) {
-                  if (
-                    (ev.type === EventType.TEXT_MESSAGE_CONTENT ||
-                      ev.type === EventType.TEXT_MESSAGE_CHUNK) &&
-                    typeof (ev as any).content === 'string'
-                  ) {
-                    text += (ev as any).content;
-                  }
+
+                if (subAccumulator.hasError()) {
+                  const err = subAccumulator.getError()!;
+                  this.workspace.updateToolExecution(delegationExec.id, {
+                    status: 'failed',
+                    error: err.message,
+                    finishedAt: Date.now(),
+                  });
+                  this.workspace.updateRun(subRun.id, {
+                    status: 'failed',
+                    error: err.message,
+                    finishedAt: Date.now(),
+                  });
+                  throw err;
                 }
+
+                const childText = subAccumulator.getAssistantText();
+                if (!childText.trim()) {
+                  const err = new Error(
+                    'Specialist completed without returning any output.',
+                  );
+                  this.workspace.updateToolExecution(delegationExec.id, {
+                    status: 'failed',
+                    error: err.message,
+                    finishedAt: Date.now(),
+                  });
+                  this.workspace.updateRun(subRun.id, {
+                    status: 'failed',
+                    error: err.message,
+                    finishedAt: Date.now(),
+                  });
+                  throw err;
+                }
+
+                this.workspace.updateToolExecution(delegationExec.id, {
+                  status: 'completed',
+                  result: { result: childText },
+                  finishedAt: Date.now(),
+                });
                 this.workspace.updateRun(subRun.id, {
                   status: 'completed',
                   finishedAt: Date.now(),
                 });
                 return {
                   specialist: target.name,
-                  result: text || 'Completed without textual output.',
+                  result: childText,
                 };
               } catch (err: any) {
+                this.workspace.updateToolExecution(delegationExec.id, {
+                  status: 'failed',
+                  error: err.message,
+                  finishedAt: Date.now(),
+                });
                 this.workspace.updateRun(subRun.id, {
                   status: controller.signal.aborted ? 'cancelled' : 'failed',
                   error: err.message,
@@ -550,14 +611,50 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
                 : undefined,
             factory: (ctx) => {
               check();
+              // Load authoritative messages from SQLite
+              const dbMessages = this.workspace.getNativeMessages(input.threadId);
+              let candidateMessages = dbMessages
+                .filter((m) => m.role === 'user' || m.role === 'assistant' || m.role === 'tool')
+                .map((m) => ({
+                  id: m.id,
+                  role: m.role as 'user' | 'assistant' | 'tool',
+                  content: m.content,
+                  toolCallId: m.toolCallId ?? undefined,
+                  toolCalls: m.toolCalls ?? undefined,
+                }));
+
+              // Apply context limit if configured
+              const limit = dot.contextLimit ?? this.config.contextLimit;
+              if (limit && limit > 0) {
+                if (limit <= 200) {
+                  if (candidateMessages.length > limit) {
+                    candidateMessages = candidateMessages.slice(-limit);
+                  }
+                } else {
+                  let budget = limit - maxTokens;
+                  if (budget < 1000) budget = limit;
+                  let usedTokens = 0;
+                  const windowed: typeof candidateMessages = [];
+                  for (let i = candidateMessages.length - 1; i >= 0; i--) {
+                    const msg = candidateMessages[i];
+                    const estTokens = Math.ceil(
+                      (typeof msg.content === 'string' ? msg.content.length : 100) / 3.5,
+                    );
+                    if (windowed.length > 0 && usedTokens + estTokens > budget) {
+                      break;
+                    }
+                    usedTokens += estTokens;
+                    windowed.unshift(msg);
+                  }
+                  candidateMessages = windowed;
+                }
+              }
+
               const converted = convertInputToTanStackAI({
                 ...ctx.input,
-                messages: ctx.input.messages.filter(
-                  (message) =>
-                    message.role !== 'system' && message.role !== 'developer',
-                ),
+                messages: candidateMessages as any,
               });
-              const lastUserMessage = [...ctx.input.messages]
+              const lastUserMessage = [...candidateMessages]
                 .reverse()
                 .find((m) => m.role === 'user')?.content || '';
               const userText =
@@ -591,6 +688,9 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
               });
             },
           });
+
+          const accumulator = new ProtocolAccumulator();
+
           subscription = this.inner
             .run({
               ...input,
@@ -609,13 +709,80 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
                 if (controller.signal.aborted)
                   observe({ type: EventType.RUN_ERROR });
                 observe(event);
-                if (
-                  (event.type === EventType.TEXT_MESSAGE_CONTENT ||
-                    event.type === EventType.TEXT_MESSAGE_CHUNK) &&
-                  typeof (event as any).content === 'string'
-                ) {
-                  assistantResponse += (event as any).content;
+
+                // Protocol accumulation
+                accumulator.processEvent(event);
+
+                // Broadcast event for active run streaming (e.g. browser reconnect or live subscribers)
+                if (runRecord) {
+                  globalRunCoordinator.broadcastEvent(runRecord.id, event);
                 }
+
+                // Tool execution tracking
+                if (runRecord) {
+                  if (event.type === EventType.TOOL_CALL_START) {
+                    const toolCallId = (event as any).toolCallId || randomUUID();
+                    const toolName =
+                      (event as any).toolCallName || (event as any).name || 'tool';
+                    this.workspace.createToolExecution({
+                      runId: runRecord.id,
+                      threadId: input.threadId,
+                      toolCallId,
+                      toolName,
+                      args: {},
+                      status: 'pending',
+                    });
+                  } else if (event.type === EventType.TOOL_CALL_RESULT) {
+                    const toolCallId = (event as any).toolCallId;
+                    if (toolCallId) {
+                      this.workspace.updateToolExecutionByCallId(toolCallId, {
+                        status: 'completed',
+                        result: (event as any).content,
+                        finishedAt: Date.now(),
+                      });
+                    }
+                  }
+                }
+
+                const formatToolCalls = (
+                  calls?: Array<{
+                    id: string;
+                    function: { name: string; arguments: string };
+                  }>,
+                ) =>
+                  calls?.map((tc) => ({
+                    id: tc.id,
+                    name: tc.function.name,
+                    args: (() => {
+                      try {
+                        return JSON.parse(tc.function.arguments || '{}');
+                      } catch {
+                        return tc.function.arguments;
+                      }
+                    })(),
+                  }));
+
+                // Save assistant message on TEXT_MESSAGE_END boundary
+                if (event.type === EventType.TEXT_MESSAGE_END) {
+                  const messageId = (event as any).messageId;
+                  const allMsgs = accumulator.getMessages();
+                  const target = allMsgs.find((m) => m.id === messageId);
+                  if (target && target.content) {
+                    try {
+                      this.workspace.saveMessage(
+                        input.threadId,
+                        'assistant',
+                        target.content,
+                        {
+                          id: target.id,
+                          runId: runRecord?.id,
+                          toolCalls: formatToolCalls(target.toolCalls),
+                        },
+                      );
+                    } catch {}
+                  }
+                }
+
                 if (
                   event.type === EventType.RUN_ERROR ||
                   event.type === EventType.RUN_FINISHED
@@ -623,6 +790,58 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
                   finished = true;
                   clearTimeout(timeout);
                   if (event.type === EventType.RUN_FINISHED) {
+                    // Check for approval interrupts
+                    const outcome = (event as any).outcome;
+                    if (
+                      outcome?.type === 'interrupt' &&
+                      Array.isArray(outcome.interrupts)
+                    ) {
+                      for (const intr of outcome.interrupts) {
+                        const existing = intr.toolCallId
+                          ? this.workspace.getToolExecutionByCallId(intr.toolCallId)
+                          : null;
+                        if (existing) {
+                          this.workspace.updateToolExecution(existing.id, {
+                            status: 'awaiting_approval',
+                            args: intr.args || existing.args,
+                          });
+                        } else {
+                          this.workspace.createToolExecution({
+                            id: intr.id || randomUUID(),
+                            runId: runRecord.id,
+                            threadId: input.threadId,
+                            toolCallId: intr.toolCallId,
+                            toolName: intr.name,
+                            args: intr.args || {},
+                            status: 'awaiting_approval',
+                          });
+                        }
+                      }
+                    }
+
+                    // Save any assistant messages that were not yet saved
+                    const completedMessages = accumulator.getMessages();
+                    const existingNative = this.workspace.getNativeMessages(input.threadId);
+                    for (const m of completedMessages) {
+                      if (m.role === 'assistant' && m.content) {
+                        const alreadySaved = existingNative.some((e) => e.id === m.id);
+                        if (!alreadySaved) {
+                          try {
+                            this.workspace.saveMessage(
+                              input.threadId,
+                              'assistant',
+                              m.content,
+                              {
+                                id: m.id,
+                                runId: runRecord?.id,
+                                toolCalls: formatToolCalls(m.toolCalls),
+                              },
+                            );
+                          } catch {}
+                        }
+                      }
+                    }
+
                     if (runRecord) {
                       try {
                         this.workspace.updateRun(runRecord.id, {
@@ -630,16 +849,7 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
                           finishedAt: Date.now(),
                         });
                       } catch {}
-                    }
-                    if (assistantResponse) {
-                      try {
-                        this.workspace.saveMessage(
-                          input.threadId,
-                          'assistant',
-                          assistantResponse,
-                          { runId: runRecord?.id },
-                        );
-                      } catch {}
+                      globalRunCoordinator.completeRun(runRecord.id);
                     }
                   } else if (event.type === EventType.RUN_ERROR && runRecord) {
                     try {
@@ -651,6 +861,7 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
                         finishedAt: Date.now(),
                       });
                     } catch {}
+                    globalRunCoordinator.completeRun(runRecord.id);
                   }
                 }
                 subscriber.next(
@@ -674,6 +885,7 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
                       finishedAt: Date.now(),
                     });
                   } catch {}
+                  globalRunCoordinator.completeRun(runRecord.id);
                 }
                 observe({ type: EventType.RUN_ERROR });
                 if (this.channel) {
@@ -691,6 +903,7 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
                         finishedAt: Date.now(),
                       });
                     } catch {}
+                    globalRunCoordinator.completeRun(runRecord.id);
                   }
                   observe({ type: EventType.RUN_ERROR });
                 }
@@ -713,6 +926,7 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
               finishedAt: Date.now(),
             });
           } catch {}
+          globalRunCoordinator.completeRun(runRecord.id);
         }
         this.inner?.abortRun();
         subscription?.unsubscribe();

@@ -97,6 +97,7 @@ export interface Dot {
   contextLimit?: number;
   maxCompletionTokens?: number;
   apiKey?: string;
+  hasApiKey?: boolean;
 }
 export interface Conversation {
   id: string;

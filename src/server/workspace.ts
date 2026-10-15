@@ -6,6 +6,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { validateLearningSettings } from '../shared/learning.js';
+import { globalRunCoordinator } from './run-coordinator.js';
 import type {
   CallReceipt,
   Conversation,
@@ -15,6 +16,7 @@ import type {
   NativeToolExecution,
   Space,
 } from '../shared/types.js';
+export type { NativeMessage, NativeRun, NativeToolExecution };
 export class WorkspaceStore {
   private db: DatabaseSync;
   readonly pages: Pages;
@@ -48,6 +50,7 @@ export class WorkspaceStore {
       ['dots', 'contextLimit', 'INTEGER'],
       ['dots', 'maxCompletionTokens', 'INTEGER'],
       ['dots', 'apiKey', 'TEXT'],
+      ['tool_executions', 'toolCallId', 'TEXT'],
       ['thread_bindings', 'learningContainerId', 'TEXT'],
       ['thread_bindings', 'updatedAt', 'INTEGER'],
       ['thread_bindings', 'archivedAt', 'INTEGER'],
@@ -106,7 +109,9 @@ export class WorkspaceStore {
     }
   }
   close() {
-    this.db.close();
+    try {
+      this.db.close();
+    } catch {}
   }
   spaces(): Space[] {
     return this.db
@@ -125,39 +130,46 @@ export class WorkspaceStore {
       .run(space.id, name, description, space.createdAt);
     return space;
   }
-  dots(): Dot[] {
+  dots(includeSecrets = false): Dot[] {
     return this.db
       .prepare('SELECT * FROM dots ORDER BY createdAt')
       .all()
-      .map((row) => ({
-        ...row,
-        spaceIds: this.db
-          .prepare(
-            'SELECT spaceId FROM dot_spaces WHERE dotId=? ORDER BY spaceId',
-          )
-          .all(String(row.id))
-          .map((grant) => String(grant.spaceId)),
-        researchAllowed: !!row.researchAllowed,
-        memoryAllowed: !!row.memoryAllowed,
-        appsAllowed: !!row.appsAllowed,
-        composioToolkits: JSON.parse(String(row.composioToolkits ?? '[]')),
-        skillDeliveryEnabled: !!row.skillDeliveryEnabled,
-        modelEndpoint: row.modelEndpoint ? String(row.modelEndpoint) : undefined,
-        modelId: row.modelId ? String(row.modelId) : undefined,
-        contextLimit:
-          row.contextLimit !== null && row.contextLimit !== undefined
-            ? Number(row.contextLimit)
-            : undefined,
-        maxCompletionTokens:
-          row.maxCompletionTokens !== null &&
-          row.maxCompletionTokens !== undefined
-            ? Number(row.maxCompletionTokens)
-            : undefined,
-        apiKey: row.apiKey ? String(row.apiKey) : undefined,
-      })) as unknown as Dot[];
+      .map((row: any) => {
+        const d: Dot = {
+          ...row,
+          spaceIds: this.db
+            .prepare(
+              'SELECT spaceId FROM dot_spaces WHERE dotId=? ORDER BY spaceId',
+            )
+            .all(String(row.id))
+            .map((grant: any) => String(grant.spaceId)),
+          researchAllowed: !!row.researchAllowed,
+          memoryAllowed: !!row.memoryAllowed,
+          appsAllowed: !!row.appsAllowed,
+          composioToolkits: JSON.parse(String(row.composioToolkits ?? '[]')),
+          skillDeliveryEnabled: !!row.skillDeliveryEnabled,
+          modelEndpoint: row.modelEndpoint ? String(row.modelEndpoint) : undefined,
+          modelId: row.modelId ? String(row.modelId) : undefined,
+          contextLimit:
+            row.contextLimit !== null && row.contextLimit !== undefined
+              ? Number(row.contextLimit)
+              : undefined,
+          maxCompletionTokens:
+            row.maxCompletionTokens !== null &&
+            row.maxCompletionTokens !== undefined
+              ? Number(row.maxCompletionTokens)
+              : undefined,
+          apiKey: row.apiKey ? String(row.apiKey) : undefined,
+          hasApiKey: Boolean(row.apiKey),
+        };
+        if (!includeSecrets) {
+          delete (d as any).apiKey;
+        }
+        return d;
+      });
   }
-  dot(id: string) {
-    return this.dots().find((dot) => dot.id === id);
+  dot(id: string, includeSecrets = true): Dot | null {
+    return this.dots(includeSecrets).find((d) => d.id === id) ?? null;
   }
   createDot(
     spaceId: string,
@@ -638,44 +650,63 @@ export class WorkspaceStore {
   }): NativeRun {
     const id = run.id || randomUUID();
     const startedAt = Date.now();
+    const existing = this.getRun(id);
+    if (existing) {
+      // Guard: do not clobber terminal runs (cancelled, failed, completed) back to running
+      const isTerminal = ['completed', 'failed', 'cancelled'].includes(existing.status);
+      const status = isTerminal ? existing.status : (run.status ?? existing.status);
+      const parentRunId =
+        run.parentRunId !== undefined ? run.parentRunId : existing.parentRunId;
+      const metadata =
+        run.metadata !== undefined ? run.metadata : existing.metadata;
+      const metadataStr = metadata ? JSON.stringify(metadata) : null;
+      this.db
+        .prepare(
+          'UPDATE runs SET threadId=?, dotId=?, parentRunId=?, status=?, startedAt=?, metadata=? WHERE id=?',
+        )
+        .run(
+          run.threadId,
+          run.dotId,
+          parentRunId ?? null,
+          status,
+          existing.startedAt,
+          metadataStr,
+          id,
+        );
+      return {
+        id,
+        threadId: run.threadId,
+        dotId: run.dotId,
+        parentRunId: parentRunId ?? null,
+        status,
+        error: existing.error,
+        startedAt: existing.startedAt,
+        finishedAt: existing.finishedAt,
+        metadata,
+      };
+    }
+
     const status = run.status ?? 'running';
     const metadataStr = run.metadata ? JSON.stringify(run.metadata) : null;
     const parentRunId = run.parentRunId ?? null;
-    const existing = this.db.prepare('SELECT id FROM runs WHERE id=?').get(id);
-    if (existing) {
-      this.db
-        .prepare(
-          'UPDATE runs SET threadId=?, dotId=?, parentRunId=?, status=?, error=NULL, startedAt=?, finishedAt=NULL, metadata=? WHERE id=?',
-        )
-        .run(
-          run.threadId,
-          run.dotId,
-          parentRunId,
-          status,
-          startedAt,
-          metadataStr,
-          id,
-        );
-    } else {
-      this.db
-        .prepare(
-          'INSERT INTO runs (id, threadId, dotId, parentRunId, status, error, startedAt, finishedAt, metadata) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?)',
-        )
-        .run(
-          id,
-          run.threadId,
-          run.dotId,
-          parentRunId,
-          status,
-          startedAt,
-          metadataStr,
-        );
-    }
+    this.db
+      .prepare(
+        'INSERT INTO runs (id, threadId, dotId, parentRunId, status, error, startedAt, finishedAt, metadata) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?)',
+      )
+      .run(
+        id,
+        run.threadId,
+        run.dotId,
+        parentRunId,
+        status,
+        startedAt,
+        metadataStr,
+      );
     return {
       id,
       threadId: run.threadId,
       dotId: run.dotId,
-      parentRunId: run.parentRunId ?? null,
+      parentRunId,
       status,
       error: null,
       startedAt,
@@ -692,6 +723,10 @@ export class WorkspaceStore {
   ): NativeRun {
     const current = this.getRun(id);
     if (!current) throw new Error('Run not found.');
+    // Guard terminal transitions: once a run is marked cancelled or failed, it cannot be overwritten by completed or running
+    if (['cancelled', 'failed'].includes(current.status) && patch.status && patch.status !== current.status) {
+      return current;
+    }
     const status = patch.status ?? current.status;
     const error = patch.error !== undefined ? patch.error : current.error;
     const finishedAt =
@@ -754,6 +789,7 @@ export class WorkspaceStore {
   }
 
   cancelActiveRuns(threadId: string, error = 'Run cancelled.') {
+    globalRunCoordinator.cancelThread(threadId, error);
     this.db
       .prepare(
         "UPDATE runs SET status='cancelled', error=?, finishedAt=? WHERE threadId=? AND status IN ('queued', 'running')",
@@ -769,20 +805,24 @@ export class WorkspaceStore {
     toolName: string;
     args?: Record<string, unknown>;
     approvalRequired?: boolean;
+    status?: NativeToolExecution['status'];
   }): NativeToolExecution {
     const id = execution.id || randomUUID();
     const createdAt = Date.now();
-    const status = execution.approvalRequired ? 'awaiting_approval' : 'pending';
+    const status =
+      execution.status ??
+      (execution.approvalRequired ? 'awaiting_approval' : 'pending');
     const safeArgs = execution.args ?? (execution as any).input ?? {};
     this.db
       .prepare(
-        'INSERT INTO tool_executions (id, runId, threadId, toolName, args, result, status, approvalRequired, approved, error, createdAt, finishedAt) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 0, NULL, ?, NULL)',
+        'INSERT INTO tool_executions (id, runId, threadId, toolName, toolCallId, args, result, status, approvalRequired, approved, error, createdAt, finishedAt) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 0, NULL, ?, NULL)',
       )
       .run(
         id,
         execution.runId,
         execution.threadId,
         execution.toolName,
+        execution.toolCallId ?? null,
         JSON.stringify(safeArgs),
         status,
         execution.approvalRequired ? 1 : 0,
@@ -807,7 +847,7 @@ export class WorkspaceStore {
     patch: Partial<
       Pick<
         NativeToolExecution,
-        'result' | 'status' | 'approved' | 'error' | 'finishedAt'
+        'result' | 'status' | 'approved' | 'error' | 'finishedAt' | 'args'
       >
     >,
   ): NativeToolExecution {
@@ -826,15 +866,18 @@ export class WorkspaceStore {
     const error = patch.error !== undefined ? patch.error : current.error;
     const finishedAt =
       patch.finishedAt !== undefined ? patch.finishedAt : current.finishedAt;
+    const args = patch.args !== undefined ? patch.args : current.args;
+    const argsStr = args !== undefined ? JSON.stringify(args) : null;
 
     this.db
       .prepare(
-        'UPDATE tool_executions SET result=?, status=?, approved=?, error=?, finishedAt=? WHERE id=?',
+        'UPDATE tool_executions SET result=?, status=?, approved=?, error=?, finishedAt=?, args=COALESCE(?, args) WHERE id=?',
       )
-      .run(resultStr ?? null, status, approved ? 1 : 0, error ?? null, finishedAt ?? null, id);
+      .run(resultStr ?? null, status, approved ? 1 : 0, error ?? null, finishedAt ?? null, argsStr, id);
 
     return {
       ...current,
+      args,
       result,
       status,
       approved,
@@ -848,10 +891,39 @@ export class WorkspaceStore {
       .prepare('SELECT * FROM tool_executions WHERE id=?')
       .get(id) as any;
     if (!row) return null;
+    return this.mapToolExecutionRow(row);
+  }
+
+  getToolExecutionByCallId(toolCallId: string): NativeToolExecution | null {
+    const row = this.db
+      .prepare(
+        'SELECT * FROM tool_executions WHERE toolCallId=? ORDER BY createdAt DESC LIMIT 1',
+      )
+      .get(toolCallId) as any;
+    if (!row) return null;
+    return this.mapToolExecutionRow(row);
+  }
+
+  updateToolExecutionByCallId(
+    toolCallId: string,
+    patch: Partial<
+      Pick<
+        NativeToolExecution,
+        'result' | 'status' | 'approved' | 'error' | 'finishedAt' | 'args'
+      >
+    >,
+  ): NativeToolExecution | null {
+    const current = this.getToolExecutionByCallId(toolCallId);
+    if (!current) return null;
+    return this.updateToolExecution(current.id, patch);
+  }
+
+  private mapToolExecutionRow(row: any): NativeToolExecution {
     return {
       id: String(row.id),
       runId: String(row.runId),
       threadId: String(row.threadId),
+      toolCallId: row.toolCallId ? String(row.toolCallId) : undefined,
       toolName: String(row.toolName),
       args: row.args ? JSON.parse(row.args) : {},
       result: row.result ? JSON.parse(row.result) : undefined,
@@ -864,25 +936,12 @@ export class WorkspaceStore {
     };
   }
 
-  getToolExecutions(runId: string): NativeToolExecution[] {
+  getToolExecutions(runOrThreadId: string): NativeToolExecution[] {
     const rows = this.db
       .prepare(
-        'SELECT * FROM tool_executions WHERE runId=? ORDER BY createdAt ASC',
+        'SELECT * FROM tool_executions WHERE runId=? OR threadId=? ORDER BY createdAt ASC',
       )
-      .all(runId) as any[];
-    return rows.map((row) => ({
-      id: String(row.id),
-      runId: String(row.runId),
-      threadId: String(row.threadId),
-      toolName: String(row.toolName),
-      args: row.args ? JSON.parse(row.args) : {},
-      result: row.result ? JSON.parse(row.result) : undefined,
-      status: row.status as NativeToolExecution['status'],
-      approvalRequired: Boolean(row.approvalRequired),
-      approved: Boolean(row.approved),
-      error: row.error ? String(row.error) : null,
-      createdAt: Number(row.createdAt),
-      finishedAt: row.finishedAt ? Number(row.finishedAt) : null,
-    }));
+      .all(runOrThreadId, runOrThreadId) as any[];
+    return rows.map((row) => this.mapToolExecutionRow(row));
   }
 }

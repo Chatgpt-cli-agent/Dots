@@ -23,6 +23,11 @@ const dotSchema = z
     skillDeliveryEnabled: z.boolean().optional(),
     spaceIds: z.array(z.string().min(1)).min(1).max(100).optional(),
     spaceId: z.string().min(1).optional(),
+    modelEndpoint: z.string().trim().max(500).optional(),
+    modelId: z.string().trim().max(100).optional(),
+    contextLimit: z.number().int().min(500).max(2000000).optional(),
+    maxCompletionTokens: z.number().int().min(1).max(128000).optional(),
+    apiKey: z.string().trim().max(500).optional(),
   })
   .strict();
 export function workspaceRoutes(platform: Platform, voice: VoiceService) {
@@ -47,7 +52,7 @@ export function workspaceRoutes(platform: Platform, voice: VoiceService) {
   app.get('/workspace', (c) =>
     c.json({
       spaces: platform.workspace.spaces(),
-      dots: platform.workspace.dots(),
+      dots: platform.workspace.dots(false),
       conversations: platform.workspace.conversations(),
       setup: platform.setup(),
       calls: platform.workspace.calls(),
@@ -99,27 +104,32 @@ export function workspaceRoutes(platform: Platform, voice: VoiceService) {
         400,
       );
     }
-    return c.json(
-      platform.workspace.createDot(
-        data.data.spaceId,
-        data.data.name,
-        data.data.instructions,
-        data.data.researchAllowed,
-        data.data.memoryAllowed,
-        data.data.spaceIds,
-        data.data.learningContainerId,
-        data.data.skillDeliveryEnabled,
-        data.data.appsAllowed,
-        data.data.composioToolkits,
-      ),
-      201,
+    const dot = platform.workspace.createDot(
+      data.data.spaceId,
+      data.data.name,
+      data.data.instructions,
+      data.data.researchAllowed,
+      data.data.memoryAllowed,
+      data.data.spaceIds,
+      data.data.learningContainerId,
+      data.data.skillDeliveryEnabled,
+      data.data.appsAllowed,
+      data.data.composioToolkits,
+      data.data.modelEndpoint,
+      data.data.modelId,
+      data.data.contextLimit,
+      data.data.maxCompletionTokens,
+      data.data.apiKey,
     );
+    const sanitized = { ...dot };
+    delete (sanitized as any).apiKey;
+    return c.json(sanitized, 201);
   });
   app.put('/dots/:id', async (c) => {
     const data = dotSchema.safeParse(await c.req.json().catch(() => null));
     if (!data.success)
       return c.json({ error: 'Invalid specialist settings.' }, 400);
-    const current = platform.workspace.dot(c.req.param('id'));
+    const current = platform.workspace.dot(c.req.param('id'), true);
     if (!current) return c.json({ error: 'Dot not found.' }, 404);
     try {
       validateLearningSettings(
@@ -139,7 +149,10 @@ export function workspaceRoutes(platform: Platform, voice: VoiceService) {
         400,
       );
     }
-    return c.json(platform.workspace.updateDot(c.req.param('id'), data.data));
+    const updated = platform.workspace.updateDot(c.req.param('id'), data.data);
+    const sanitized = { ...updated };
+    delete (sanitized as any).apiKey;
+    return c.json(sanitized);
   });
   app.post('/conversations', async (c) => {
     const data = z

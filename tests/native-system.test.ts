@@ -5,6 +5,11 @@ import { Store } from '../src/server/store.js';
 import { WorkspaceStore } from '../src/server/workspace.js';
 import { Platform } from '../src/server/platform.js';
 import { ComputerService } from '../src/server/computer-service.js';
+import { EventType } from '@ag-ui/core';
+import { lastValueFrom, toArray } from 'rxjs';
+import { ProtocolAccumulator } from '../src/server/protocol-accumulator.js';
+import { NativeAgentRunner } from '../src/server/native-runner.js';
+import { RunCoordinator, globalRunCoordinator } from '../src/server/run-coordinator.js';
 import type { PlatformConfig } from '../src/server/platform-config.js';
 
 const resources: (() => void)[] = [];
@@ -328,3 +333,252 @@ it('supports specialist delegation with parent/child run tracking', async () => 
     'Analysis completed successfully',
   );
 });
+
+it('accumulates AG-UI text delta events, tool events, and preserves message IDs and boundaries', () => {
+  const accumulator = new ProtocolAccumulator();
+
+  // 1. Text message with deltas (the AG-UI standard)
+  accumulator.processEvent({
+    type: EventType.TEXT_MESSAGE_START,
+    messageId: 'msg-assist-1',
+    role: 'assistant',
+  } as any);
+  accumulator.processEvent({
+    type: EventType.TEXT_MESSAGE_CONTENT,
+    messageId: 'msg-assist-1',
+    delta: 'Hello, ',
+  } as any);
+  accumulator.processEvent({
+    type: EventType.TEXT_MESSAGE_CHUNK,
+    messageId: 'msg-assist-1',
+    delta: 'I am your specialist.',
+  } as any);
+  accumulator.processEvent({
+    type: EventType.TEXT_MESSAGE_END,
+    messageId: 'msg-assist-1',
+  } as any);
+
+  // 2. Tool call events
+  accumulator.processEvent({
+    type: EventType.TOOL_CALL_START,
+    toolCallId: 'tc-1',
+    toolCallName: 'read_space_page',
+    parentMessageId: 'msg-assist-1',
+  } as any);
+  accumulator.processEvent({
+    type: EventType.TOOL_CALL_ARGS,
+    toolCallId: 'tc-1',
+    delta: '{"pageId":"p-123"}',
+  } as any);
+  accumulator.processEvent({
+    type: EventType.TOOL_CALL_END,
+    toolCallId: 'tc-1',
+  } as any);
+  accumulator.processEvent({
+    type: EventType.TOOL_CALL_RESULT,
+    toolCallId: 'tc-1',
+    messageId: 'msg-tool-1',
+    content: 'Page contents: System Architecture',
+  } as any);
+
+  // 3. Complete run
+  accumulator.processEvent({
+    type: EventType.RUN_FINISHED,
+  } as any);
+
+  expect(accumulator.isDone()).toBe(true);
+  expect(accumulator.hasError()).toBe(false);
+  expect(accumulator.getAssistantText()).toBe('Hello, I am your specialist.');
+
+  const messages = accumulator.getMessages();
+  expect(messages).toHaveLength(2);
+  expect(messages[0].id).toBe('msg-assist-1');
+  expect(messages[0].role).toBe('assistant');
+  expect(messages[0].content).toBe('Hello, I am your specialist.');
+  expect(messages[0].toolCalls?.[0].id).toBe('tc-1');
+  expect(messages[0].toolCalls?.[0].function.name).toBe('read_space_page');
+
+  expect(messages[1].id).toBe('msg-tool-1');
+  expect(messages[1].role).toBe('tool');
+  expect(messages[1].content).toBe('Page contents: System Architecture');
+  expect(messages[1].toolCallId).toBe('tc-1');
+
+  const toolCalls = accumulator.getToolCalls();
+  expect(toolCalls).toHaveLength(1);
+  expect(toolCalls[0].toolCallId).toBe('tc-1');
+  expect(toolCalls[0].status).toBe('completed');
+  expect(toolCalls[0].result).toBe('Page contents: System Architecture');
+});
+
+it('reconnects and replays durable SQLite history and pending approvals via NativeAgentRunner after server restart', async () => {
+  const dbPath = createTestDbPath();
+  const workspace1 = new WorkspaceStore(dbPath, 'owner-1');
+  resources.push(() => workspace1.close());
+
+  const dot = workspace1.dots()[0];
+  const thread = workspace1.bindThread('thread-restart-1', dot.id, 'Restart Thread');
+
+  // Populate history in SQLite
+  workspace1.saveMessage(thread.id, 'user', 'What is the deployment plan?', {
+    id: 'msg-user-10',
+  });
+  workspace1.saveMessage(thread.id, 'assistant', 'Here is the plan: deploy to prod.', {
+    id: 'msg-asst-10',
+  });
+
+  // Create run and a pending approval tool execution
+  const run = workspace1.createRun({
+    id: 'run-approval-1',
+    threadId: thread.id,
+    dotId: dot.id,
+  });
+  workspace1.createToolExecution({
+    id: 'exec-approval-1',
+    runId: run.id,
+    threadId: thread.id,
+    toolCallId: 'call-deploy-1',
+    toolName: 'request_connection_action',
+    args: { action: 'deploy', target: 'production' },
+    approvalRequired: true,
+  });
+
+  // Close first workspace store (simulating server shutdown)
+  workspace1.close();
+
+  // Create a completely fresh workspace store & runner on the existing database (simulating server restart)
+  const workspace2 = new WorkspaceStore(dbPath, 'owner-1');
+  resources.push(() => workspace2.close());
+  const coordinator = new RunCoordinator();
+  const nativeRunner = new NativeAgentRunner({ workspace: workspace2, runCoordinator: coordinator });
+
+  // Connect to the thread via native runner (as the browser frontend does via copilotkit.connectAgent)
+  const events = await lastValueFrom(
+    nativeRunner.connect({ threadId: thread.id }).pipe(toArray()),
+  );
+
+  // 1. MESSAGES_SNAPSHOT event emitted with authoritative history
+  const snapshotEvent = events.find((e: any) => e.type === EventType.MESSAGES_SNAPSHOT) as any;
+  expect(snapshotEvent).toBeDefined();
+  expect(snapshotEvent.messages).toHaveLength(2);
+  expect(snapshotEvent.messages[0]).toMatchObject({
+    id: 'msg-user-10',
+    role: 'user',
+    content: 'What is the deployment plan?',
+  });
+  expect(snapshotEvent.messages[1]).toMatchObject({
+    id: 'msg-asst-10',
+    role: 'assistant',
+    content: 'Here is the plan: deploy to prod.',
+  });
+
+  // 2. Pending approval interrupt event emitted
+  const interruptEvent = events.find(
+    (e: any) => e.type === EventType.RUN_FINISHED && e.outcome?.type === 'interrupt',
+  ) as any;
+  expect(interruptEvent).toBeDefined();
+  expect(interruptEvent.outcome.interrupts[0]).toMatchObject({
+    id: 'exec-approval-1',
+    name: 'request_connection_action',
+    toolCallId: 'call-deploy-1',
+  });
+});
+
+it('coordinates atomic run cancellation and guards against terminal status overwrites', () => {
+  const workspace = new WorkspaceStore(':memory:', 'owner-1');
+  resources.push(() => workspace.close());
+
+  const dot = workspace.dots()[0];
+  const thread = workspace.bindThread('thread-cancel-test', dot.id, 'Cancel Thread');
+  const coordinator = new RunCoordinator();
+
+  const controller1 = new AbortController();
+  let agent1Aborted = false;
+  const mockAgent1 = { abortRun: () => { agent1Aborted = true; } };
+
+  // 1. Register run 1
+  coordinator.register(thread.id, 'run-active-1', dot.id, controller1, mockAgent1);
+  const run1 = workspace.createRun({ id: 'run-active-1', threadId: thread.id, dotId: dot.id });
+  expect(coordinator.isThreadActive(thread.id)).toBe(true);
+
+  // 2. Cancel run 1 via coordinator
+  const didCancel = coordinator.cancelThread(thread.id, 'User cancelled');
+  expect(didCancel).toBe(true);
+  expect(controller1.signal.aborted).toBe(true);
+  expect(agent1Aborted).toBe(true);
+  expect(coordinator.isThreadActive(thread.id)).toBe(false);
+
+  workspace.updateRun(run1.id, {
+    status: 'cancelled',
+    finishedAt: Date.now(),
+  });
+  expect(workspace.getRun(run1.id)?.status).toBe('cancelled');
+
+  // 3. Late arriving event/callback cannot overwrite cancelled terminal status
+  workspace.updateRun(run1.id, {
+    status: 'completed',
+    finishedAt: Date.now(),
+  });
+  expect(workspace.getRun(run1.id)?.status).toBe('cancelled');
+
+  workspace.updateRun(run1.id, {
+    status: 'running',
+  });
+  expect(workspace.getRun(run1.id)?.status).toBe('cancelled');
+
+  // 4. Calling createRun on an existing cancelled run does not resurrect it
+  const reCreated = workspace.createRun({ id: run1.id, threadId: thread.id, dotId: dot.id, status: 'running' });
+  expect(reCreated.status).toBe('cancelled');
+});
+
+it('supports per-Dot model configuration and sanitizes stored API keys', () => {
+  const workspace = new WorkspaceStore(':memory:', 'owner-1');
+  resources.push(() => workspace.close());
+
+  const space = workspace.spaces()[0];
+  const customDot = workspace.createDot(
+    space.id,
+    'Local Specialist',
+    'Execute tasks with local endpoint',
+    true,
+    true,
+    [space.id],
+    undefined,
+    false,
+    true,
+    [],
+    'http://192.168.1.100:11434/v1',
+    'qwen2.5-coder:32b',
+    16384,
+    4096,
+    'secret-token-12345',
+  );
+
+  // Dot configuration is persisted
+  expect(customDot.modelEndpoint).toBe('http://192.168.1.100:11434/v1');
+  expect(customDot.modelId).toBe('qwen2.5-coder:32b');
+  expect(customDot.contextLimit).toBe(16384);
+  expect(customDot.maxCompletionTokens).toBe(4096);
+
+  // Public dots() listing strips secrets and sets hasApiKey flag
+  const publicDots = workspace.dots(false);
+  const publicCustom = publicDots.find((d) => d.id === customDot.id);
+  expect(publicCustom).toBeDefined();
+  expect(publicCustom?.apiKey).toBeUndefined();
+  expect(publicCustom?.hasApiKey).toBe(true);
+
+  // Internal dot() retrieval preserves apiKey for model execution
+  const internalCustom = workspace.dot(customDot.id, true);
+  expect(internalCustom?.apiKey).toBe('secret-token-12345');
+
+  // Updating the Dot preserves endpoints and apiKey
+  const updated = workspace.updateDot(customDot.id, {
+    name: 'Renamed Specialist', // Renaming must not break backend
+    contextLimit: 32768,
+    apiKey: 'new-secret-999',
+  });
+  expect(updated.name).toBe('Renamed Specialist');
+  expect(updated.modelEndpoint).toBe('http://192.168.1.100:11434/v1');
+  expect(updated.contextLimit).toBe(32768);
+  expect(workspace.dot(customDot.id, true)?.apiKey).toBe('new-secret-999');
+});
+

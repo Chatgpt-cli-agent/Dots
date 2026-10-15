@@ -69,6 +69,23 @@ export function WorkspaceDialog({
   const [skillDelivery, setSkillDelivery] = useState(
     dialog.type === 'dot' ? (dialog.dot?.skillDeliveryEnabled ?? false) : false,
   );
+  const [modelEndpoint, setModelEndpoint] = useState(
+    dialog.type === 'dot' ? (dialog.dot?.modelEndpoint ?? '') : '',
+  );
+  const [modelId, setModelId] = useState(
+    dialog.type === 'dot' ? (dialog.dot?.modelId ?? '') : '',
+  );
+  const [contextLimit, setContextLimit] = useState(
+    dialog.type === 'dot' && dialog.dot?.contextLimit
+      ? String(dialog.dot.contextLimit)
+      : '',
+  );
+  const [maxCompletionTokens, setMaxCompletionTokens] = useState(
+    dialog.type === 'dot' && dialog.dot?.maxCompletionTokens
+      ? String(dialog.dot.maxCompletionTokens)
+      : '',
+  );
+  const [apiKey, setApiKey] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [theme, setTheme] = useState(themePreference);
@@ -164,6 +181,11 @@ export function WorkspaceDialog({
                   .filter(Boolean),
                 learningContainerId: learningContainer.trim() || null,
                 skillDeliveryEnabled: skillDelivery,
+                ...(modelEndpoint.trim() ? { modelEndpoint: modelEndpoint.trim() } : {}),
+                ...(modelId.trim() ? { modelId: modelId.trim() } : {}),
+                ...(contextLimit.trim() ? { contextLimit: Number(contextLimit.trim()) } : {}),
+                ...(maxCompletionTokens.trim() ? { maxCompletionTokens: Number(maxCompletionTokens.trim()) } : {}),
+                ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
               };
             }
             if (dialog.type === 'settings') {
@@ -397,6 +419,65 @@ export function WorkspaceDialog({
               >
                 Set up Learning and review skills ↗
               </a>
+            </fieldset>
+          )}
+          {dialog.type === 'dot' && (
+            <fieldset className="space-access-fields">
+              <legend>Model & Runtime Configuration</legend>
+              <label className="field-label" htmlFor="dot-model-endpoint">
+                Model endpoint URL
+              </label>
+              <input
+                id="dot-model-endpoint"
+                value={modelEndpoint}
+                placeholder="http://127.0.0.1:11434/v1"
+                onChange={(e) => setModelEndpoint(e.target.value)}
+              />
+              <label className="field-label" htmlFor="dot-model-id">
+                Model ID
+              </label>
+              <input
+                id="dot-model-id"
+                value={modelId}
+                placeholder="llama3.1:8b"
+                onChange={(e) => setModelId(e.target.value)}
+              />
+              <div style={{ display: 'flex', gap: '1rem' }}>
+                <div style={{ flex: 1 }}>
+                  <label className="field-label" htmlFor="dot-context-limit">
+                    Context limit (tokens)
+                  </label>
+                  <input
+                    id="dot-context-limit"
+                    type="number"
+                    value={contextLimit}
+                    placeholder="8192"
+                    onChange={(e) => setContextLimit(e.target.value)}
+                  />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <label className="field-label" htmlFor="dot-max-tokens">
+                    Max completion tokens
+                  </label>
+                  <input
+                    id="dot-max-tokens"
+                    type="number"
+                    value={maxCompletionTokens}
+                    placeholder="2048"
+                    onChange={(e) => setMaxCompletionTokens(e.target.value)}
+                  />
+                </div>
+              </div>
+              <label className="field-label" htmlFor="dot-api-key">
+                API key (optional)
+              </label>
+              <input
+                id="dot-api-key"
+                type="password"
+                value={apiKey}
+                placeholder={dialog.dot?.hasApiKey ? '••••••••' : 'Optional for local models'}
+                onChange={(e) => setApiKey(e.target.value)}
+              />
             </fieldset>
           )}
           {dialog.type === 'dot' && dialog.dot && (

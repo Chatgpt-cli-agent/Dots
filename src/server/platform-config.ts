@@ -57,6 +57,7 @@ export interface PlatformConfig extends WebConfig {
   model?: string;
   apiKey?: string;
   baseUrl: string;
+  contextLimit?: number;
   agentRunTimeoutMs?: number;
   computerSupervisorUrl?: string;
   computerSupervisorToken?: string;

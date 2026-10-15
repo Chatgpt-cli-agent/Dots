@@ -9,7 +9,10 @@ import {
   type CopilotHonoApp,
 } from '@copilotkit/runtime/v2';
 import { EventType } from '@ag-ui/core';
-import { lastValueFrom, toArray } from 'rxjs';
+import { lastValueFrom, toArray, tap } from 'rxjs';
+import { NativeAgentRunner } from './native-runner.js';
+import { ProtocolAccumulator } from './protocol-accumulator.js';
+import { globalRunCoordinator } from './run-coordinator.js';
 import { voiceReceiptMessagePrefix } from '../shared/voice-receipt.js';
 import { scheduledTaskMessagePrefix } from '../shared/scheduled-message.js';
 import { createSlackChannel } from './slack-channel.js';
@@ -39,6 +42,7 @@ export class Platform {
     getThreadMessages(input: { threadId: string; userId: string }): Promise<{ messages: { role: string; content?: unknown }[] }>;
   };
   readonly handler?: CopilotHonoApp;
+  readonly nativeRunner?: NativeAgentRunner;
   constructor(
     readonly store: Store,
     readonly workspace: WorkspaceStore,
@@ -132,6 +136,11 @@ export class Platform {
       }
       return Object.fromEntries(entries);
     };
+    const nativeRunner = new NativeAgentRunner({
+      workspace,
+      runCoordinator: globalRunCoordinator,
+    });
+    this.nativeRunner = nativeRunner;
     const runtime = this.intelligence
       ? new CopilotRuntime({
           intelligence: this.intelligence,
@@ -146,6 +155,7 @@ export class Platform {
           generateThreadNames: true,
         })
       : new (CopilotRuntime as any)({
+          runner: nativeRunner,
           telemetryId: this.setupTelemetry.identity,
           telemetryProperties: this.setupTelemetry.metadata,
           identifyUser: async () => ({
@@ -471,22 +481,16 @@ export class Platform {
       this.setupTelemetry,
     );
 
-    let runError: Error | undefined;
-    let assistantText = '';
-    const abortController = new AbortController();
+    const accumulator = new ProtocolAccumulator();
     const abortHandler = () => {
-      abortController.abort();
+      globalRunCoordinator.cancelThread(threadId, 'Turn cancelled by abort signal');
       agent.abortRun();
-      this.workspace.updateRun(run.id, {
-        status: 'cancelled',
-        finishedAt: Date.now(),
-      });
     };
     signal.addEventListener('abort', abortHandler, { once: true });
 
     try {
       signal.throwIfAborted();
-      const events = await lastValueFrom(
+      await lastValueFrom(
         agent
           .run({
             runId: run.id,
@@ -497,41 +501,28 @@ export class Platform {
             state: {},
             forwardedProps: {},
           })
-          .pipe(toArray()),
+          .pipe(
+            tap((ev) => accumulator.processEvent(ev)),
+            toArray(),
+          ),
       );
       signal.throwIfAborted();
 
-      for (const ev of events) {
-        if (ev.type === EventType.RUN_ERROR) {
-          runError = new Error((ev as any).message || 'Agent run error');
-        }
-        if (
-          (ev.type === EventType.TEXT_MESSAGE_CONTENT ||
-            ev.type === EventType.TEXT_MESSAGE_CHUNK) &&
-          typeof (ev as any).content === 'string'
-        ) {
-          assistantText += (ev as any).content;
-        }
+      if (accumulator.hasError()) {
+        throw accumulator.getError()!;
       }
 
-      if (runError) throw runError;
+      const assistantText = accumulator.getAssistantText();
       if (!assistantText.trim()) {
         throw new Error(
           'The current compute turn returned no assistant response.',
         );
       }
 
-      this.workspace.updateRun(run.id, {
-        status: 'completed',
-        finishedAt: Date.now(),
-      });
-      this.workspace.saveMessage(threadId, 'assistant', assistantText, {
-        runId: run.id,
-      });
       this.workspace.touchThread(threadId);
       return assistantText;
     } catch (error) {
-      if (signal.aborted || abortController.signal.aborted) {
+      if (signal.aborted) {
         this.workspace.updateRun(run.id, {
           status: 'cancelled',
           finishedAt: Date.now(),
