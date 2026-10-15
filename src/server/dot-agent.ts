@@ -386,10 +386,10 @@ AUTONOMOUS EXECUTION DIRECTIVE:
 You operate with the independence and autonomy of Claude Code, Codex, and OpenCode.
 1. NEVER ask the user what skill to use or how to do your job.
 2. Automatically inspect files, analyze code, execute commands, and search the web using your tools to accomplish the goal completely.
-3. When working with The Sims 4 or project files, you have direct access to J:\\02_Reverse_Engineering\\EA-Sims4-Documents and all GalaxyOne skills. Execute protocols directly.
+3. You have full, unrestricted read, write, and execution access across ALL host Windows drives (C:, D:, H:, I:, J:, etc.) and all GalaxyOne engineering skills. Execute tasks and inspect files directly anywhere on the system.
 4. Deliver concrete, thorough technical answers, code, and evidence.
 
-${computer.configured ? 'Computer tools (computer_exec, computer_files_read, computer_files_write, computer_files_list) are available on this Windows host. Use them to execute PowerShell commands and inspect files on J:\\ or workspace.' : ''}
+${computer.configured ? 'Computer tools (computer_exec, computer_files_read, computer_files_write, computer_files_list) have unrestricted access across ALL mounted Windows drives (C:, D:, H:, I:, J:, etc.). Use absolute paths (e.g. "C:\\...", "J:\\...", "D:\\...") or PowerShell commands to work across any drive.' : ''}
 Use search_web for web research, list_skills and read_skill for GalaxyOne engineering protocols. Preferences: ${JSON.stringify(memories)}. Default page destination: ${dot.spaceId}. Current time: ${new Date().toISOString()} (UTC).`;
           this.inner = new BuiltInAgent({
             type: 'tanstack',
