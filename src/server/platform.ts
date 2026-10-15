@@ -60,7 +60,13 @@ export class Platform {
       config,
       () => store.settings().paused,
     );
-    this.connections = new ConnectionService(workspace.connections);
+    this.connections = new ConnectionService(
+      workspace.connections,
+      undefined,
+      undefined,
+      workspace.plugins,
+    );
+    this.plugins.setConnectionService(this.connections);
     this.localIntelligence = {
       async createThread(input) {
         return { id: input.threadId };

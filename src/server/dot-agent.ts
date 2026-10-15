@@ -396,7 +396,12 @@ export class DotAgent extends AbstractAgent {
           (tool) => tool.name === connectionActionTool.name,
         );
         const connected = connectionTools(
-          new ConnectionService(this.workspace.connections),
+          new ConnectionService(
+            this.workspace.connections,
+            undefined,
+            undefined,
+            this.workspace.plugins,
+          ),
           dot.id,
           input.threadId,
           check,

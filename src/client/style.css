@@ -4313,3 +4313,40 @@ h3 {
   display: block;
   margin: 0.6rem 0;
 }
+.plugin-preview-card {
+  background: var(--bg-subtle, rgba(0, 0, 0, 0.03));
+  border: 1px dashed var(--line);
+  padding: 1rem;
+  border-radius: 6px;
+  margin: 0.8rem 0;
+}
+.plugin-services-section {
+  margin-top: 1rem;
+  border-top: 1px solid var(--line);
+  padding-top: 0.8rem;
+}
+.plugin-service-card {
+  background: var(--bg-subtle, rgba(0, 0, 0, 0.02));
+  border: 1px solid var(--line);
+  padding: 0.8rem;
+  border-radius: 6px;
+  margin: 0.6rem 0;
+}
+.badge-success {
+  display: inline-block;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--success-bg, #e6f4ea);
+  color: var(--success-fg, #137333);
+  font-weight: 500;
+}
+.badge-warning {
+  display: inline-block;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--warning-bg, #fef7e0);
+  color: var(--warning-fg, #b06000);
+  font-weight: 500;
+}

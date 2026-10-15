@@ -8,6 +8,7 @@ import type {
   ConnectionTool,
 } from '../shared/connection-types.js';
 import type { ConnectionStore } from './connection-store.js';
+import type { PluginStore } from './plugin-store.js';
 const MAX_TOOLS = 100;
 const MAX_SCHEMA_BYTES = 16_000;
 const MAX_RESULT_CHARS = 20_000;
@@ -84,7 +85,16 @@ export function exposedTools(connections: Connection[]): ExposedTool[] {
   return connections
     .flatMap((connection) =>
       connection.tools.map((tool) => {
-        const base = `${slug(connection.name, 20)}__${slug(tool.name, 40)}`;
+        let base: string;
+        if (connection.id.startsWith('plugin:')) {
+          const parts = connection.name.split(':');
+          const pName = parts[0] ?? 'p';
+          const sName = parts[1] ?? 's';
+          const fullBase = `plugin__${slug(pName, 16)}__${slug(sName, 16)}__${slug(tool.name, 28)}`;
+          base = fullBase.length > 64 ? fullBase.slice(0, 64) : fullBase;
+        } else {
+          base = `${slug(connection.name, 20)}__${slug(tool.name, 40)}`;
+        }
         let name = base;
         for (let n = 2; used.has(name); n++) name = `${base.slice(0, 60)}_${n}`;
         used.add(name);
@@ -148,7 +158,12 @@ export class ConnectionService {
     readonly store: ConnectionStore,
     private transport: McpTransportFactory = httpTransport,
     private timeoutMs = 60_000,
+    private pluginStore?: PluginStore,
   ) {}
+
+  setPluginStore(pluginStore: PluginStore) {
+    this.pluginStore = pluginStore;
+  }
   private async session<T>(
     target: { url: string; token?: string },
     signal: AbortSignal | undefined,
@@ -256,8 +271,33 @@ export class ConnectionService {
       connection.error,
     );
   }
+  private pluginConnections(dotId: string): Connection[] {
+    if (!this.pluginStore) return [];
+    return this.pluginStore
+      .list()
+      .filter((p) => p.enabled && p.dotIds.includes(dotId))
+      .flatMap((p) =>
+        p.services
+          .filter((s) => s.enabled)
+          .map((s) => ({
+            id: `plugin:${p.id}:${s.name}`,
+            dotId,
+            name: `${p.name}:${s.name}`,
+            url: s.url,
+            hasToken: s.hasToken,
+            tools: s.tools,
+            error: s.error,
+            createdAt: p.installedAt,
+            updatedAt: s.updatedAt,
+          })),
+      );
+  }
+
   tools(dotId: string) {
-    return exposedTools(this.store.list(dotId));
+    return exposedTools([
+      ...this.store.list(dotId),
+      ...this.pluginConnections(dotId),
+    ]);
   }
   resolve(dotId: string, name: string) {
     const match = this.tools(dotId).find((tool) => tool.name === name);
@@ -284,8 +324,26 @@ export class ConnectionService {
     signal?: AbortSignal,
   ): Promise<ConnectionActionResult> {
     try {
+      let credentials: { url: string; token?: string };
+      if (exposed.connection.id.startsWith('plugin:')) {
+        const parts = exposed.connection.id.split(':');
+        const pluginId = parts[1];
+        const serviceName = parts.slice(2).join(':');
+        const creds = this.pluginStore?.getServiceCredentials(pluginId, serviceName);
+        if (!creds) throw new Error('Plugin service credentials not found.');
+        const service = this.pluginStore?.getService(pluginId, serviceName);
+        if (service?.requiresToken && !creds.token) {
+          return {
+            isError: true,
+            text: 'The connected service rejected the credentials. Check the bearer token.',
+          };
+        }
+        credentials = creds;
+      } else {
+        credentials = this.store.credentials(exposed.connection.id);
+      }
       return await this.session(
-        this.store.credentials(exposed.connection.id),
+        credentials,
         signal,
         async (client, bounded) =>
           normalizeResult(
@@ -298,6 +356,45 @@ export class ConnectionService {
       );
     } catch (error) {
       return { isError: true, text: failure(error) };
+    }
+  }
+
+  async discoverTools(
+    target: { url: string; token?: string },
+    previous: ConnectionTool[] = [],
+  ): Promise<ConnectionTool[]> {
+    return this.discover(target, previous);
+  }
+
+  async refreshPluginService(pluginId: string, serviceName: string) {
+    if (!this.pluginStore) throw new Error('Plugin store not configured.');
+    const service = this.pluginStore.getService(pluginId, serviceName);
+    if (!service) throw new Error('Plugin service not found.');
+    try {
+      const credentials = this.pluginStore.getServiceCredentials(pluginId, serviceName);
+      if (!credentials) throw new Error('Plugin service credentials not found.');
+      if (service.requiresToken && !credentials.token) {
+        return this.pluginStore.setServiceTools(
+          pluginId,
+          serviceName,
+          service.tools,
+          'The connected service rejected the credentials. Check the bearer token.',
+        );
+      }
+      const discovered = await this.discover(credentials, service.tools);
+      return this.pluginStore.setServiceTools(
+        pluginId,
+        serviceName,
+        discovered,
+        null,
+      );
+    } catch (error) {
+      return this.pluginStore.setServiceTools(
+        pluginId,
+        serviceName,
+        service.tools,
+        failure(error),
+      );
     }
   }
 }
