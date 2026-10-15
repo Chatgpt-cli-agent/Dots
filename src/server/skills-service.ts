@@ -1,17 +1,20 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { defineTool } from '@copilotkit/runtime/v2';
 import { z } from 'zod';
 
 export function getSkillsRoot(): string {
-  if (process.env.GALAXYONE_SKILLS_PATH)
-    return process.env.GALAXYONE_SKILLS_PATH;
   if (process.env.SKILLS_PATH) return process.env.SKILLS_PATH;
   if (process.env.SKILLS_DIR) return process.env.SKILLS_DIR;
+  if (process.env.OPENDOTS_SKILLS_PATH) return process.env.OPENDOTS_SKILLS_PATH;
+  if (process.env.GALAXYONE_SKILLS_PATH)
+    return process.env.GALAXYONE_SKILLS_PATH;
   const standardPaths = [
+    path.resolve(process.cwd(), 'skills'),
+    fileURLToPath(new URL('../../skills', import.meta.url)),
     'C:\\Users\\jmoor\\Projects\\GalaxyOne\\skills',
     path.resolve(process.cwd(), '../GalaxyOne/skills'),
-    path.resolve(process.cwd(), 'skills'),
   ];
   for (const p of standardPaths) {
     if (fs.existsSync(p)) return p;
