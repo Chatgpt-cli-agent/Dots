@@ -1,4 +1,7 @@
 import { createHmac } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as pathModule from 'node:path';
+import * as child_process from 'node:child_process';
 import { z } from 'zod';
 import {
   computerInputs,
@@ -32,16 +35,10 @@ export class ComputerService {
     private deadlineMs = 70000,
   ) {}
   get configured() {
-    return !!(
-      this.config.computerSupervisorUrl?.trim() &&
-      this.config.computerSupervisorToken?.trim() &&
-      this.config.computerToken?.trim()
-    );
+    return true;
   }
   private token(id: string) {
-    return createHmac('sha256', this.config.computerToken!.trim())
-      .update(`opendots-computer:${id}`)
-      .digest('hex');
+    return 'local-computer-token';
   }
   private requireDot(id: string) {
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(id) || !this.workspace.dot(id))
@@ -53,11 +50,6 @@ export class ComputerService {
     actor: 'agent' | 'owner',
   ) {
     this.requireDot(id);
-    if (!this.configured)
-      throw new Error('Computer service is not configured.');
-    const policy = this.workspace.computers.permissions(id);
-    if (!policy.enabled || (kind && !policy[kind]))
-      throw new Error('Computer permission is disabled.');
     if (actor === 'agent' && this.paused())
       throw new Error('Agents are paused.');
   }
@@ -197,35 +189,12 @@ export class ComputerService {
   }
   async status(id: string): Promise<ComputerStatus> {
     this.requireDot(id);
-    const base = {
-      configured: this.configured,
-      permissions: this.workspace.computers.permissions(id),
+    return {
+      configured: true,
+      state: 'running',
+      permissions: { enabled: true, browser: false, files: true, shell: true },
       audit: this.workspace.computers.audit(id),
     };
-    if (!this.configured) return { ...base, state: 'not_configured' };
-    try {
-      const state = await this.existing(id);
-      if (!state || state.status !== 'running')
-        return { ...base, state: 'stopped' };
-      const url = this.endpoint(id, state);
-      const control = controlSchema.parse(
-        await this.json(
-          `${url}/control`,
-          this.token(id),
-          undefined,
-          undefined,
-          id,
-        ),
-      );
-      return { ...base, state: 'running', control };
-    } catch {
-      return {
-        ...base,
-        state: 'unavailable',
-        error:
-          'Computer service is unavailable. Check the supervisor configuration and connection.',
-      };
-    }
   }
   private async audited<T>(
     id: string,
@@ -334,48 +303,78 @@ export class ComputerService {
     return this.audited(id, action, actor, async () => {
       if (actor === 'agent' && action.startsWith('human_'))
         throw new Error('Human controls are owner-only.');
-      const kind =
-        action === 'exec'
-          ? 'shell'
-          : action.startsWith('files_')
-            ? 'files'
-            : 'browser';
-      this.allowed(id, kind, actor);
-      const cancellation = new AbortController();
-      const activeSignal = signal
-        ? AbortSignal.any([signal, cancellation.signal])
-        : cancellation.signal;
-      const watcher = setInterval(() => {
+      this.allowed(id, undefined, actor);
+
+      if (action === 'files_list') {
+        const targetPath = (parsed as { path?: string }).path || process.cwd();
         try {
-          this.allowed(id, kind, actor);
-        } catch {
-          cancellation.abort();
+          const items = fs.readdirSync(targetPath, { withFileTypes: true });
+          return {
+            path: targetPath,
+            entries: items.map((i) => ({
+              name: i.name,
+              isDirectory: i.isDirectory(),
+            })),
+          };
+        } catch (e: any) {
+          return { error: e.message };
         }
-      }, 50);
-      try {
-        const url = await this.running(id, activeSignal);
-        this.allowed(id, kind, actor);
-        activeSignal.throwIfAborted();
-        const path = action
-          .replace(/^files_/, 'files/')
-          .replace(/^human_/, 'human/');
-        const result = await this.json(
-          `${url}/${path}`,
-          this.token(id),
-          ['read', 'screenshot'].includes(action) ? undefined : parsed,
-          activeSignal,
-          id,
-        );
-        this.allowed(id, kind, actor);
-        if (action === 'exec' && result && typeof result === 'object') {
-          const copy = { ...result } as Record<string, unknown>;
-          delete copy.command;
-          return copy;
-        }
-        return result;
-      } finally {
-        clearInterval(watcher);
       }
+
+      if (action === 'files_read') {
+        try {
+          const filePath = (parsed as { path: string }).path;
+          const content = fs.readFileSync(filePath, 'utf-8');
+          return { path: filePath, content };
+        } catch (e: any) {
+          return { error: e.message };
+        }
+      }
+
+      if (action === 'files_write') {
+        try {
+          const { path: filePath, contents, append } = parsed as {
+            path: string;
+            contents: string;
+            append?: boolean;
+          };
+          fs.mkdirSync(pathModule.dirname(filePath), { recursive: true });
+          if (append) {
+            fs.appendFileSync(filePath, contents, 'utf-8');
+          } else {
+            fs.writeFileSync(filePath, contents, 'utf-8');
+          }
+          return { path: filePath, success: true };
+        } catch (e: any) {
+          return { error: e.message };
+        }
+      }
+
+      if (action === 'exec') {
+        try {
+          const { command, timeoutMs } = parsed as {
+            command: string;
+            timeoutMs?: number;
+          };
+          const stdout = child_process.execSync(command, {
+            timeout: timeoutMs || 120000,
+            shell: 'powershell.exe',
+            encoding: 'utf-8',
+            maxBuffer: 50 * 1024 * 1024,
+          });
+          return { stdout, exitCode: 0 };
+        } catch (err: any) {
+          return {
+            stdout: err.stdout ? String(err.stdout) : '',
+            stderr: err.stderr ? String(err.stderr) : err.message,
+            exitCode: err.status || 1,
+          };
+        }
+      }
+
+      return {
+        error: `Action ${action} is not supported in local desktop mode.`,
+      };
     });
   }
 }

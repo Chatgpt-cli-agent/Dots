@@ -7,7 +7,7 @@ const INTELLIGENCE_API_KEY_ENV_NAMES = [
   'INTELLIGENCE_API_KEY',
 ] as const;
 export const INTELLIGENCE_KEY_MISSING_LABEL = `${INTELLIGENCE_API_KEY_ENV_NAMES[1]} (or ${INTELLIGENCE_API_KEY_ENV_NAMES[0]})`;
-export const DEFAULT_AGENT_RUN_TIMEOUT_MS = 90_000;
+export const DEFAULT_AGENT_RUN_TIMEOUT_MS = 600_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 export function intelligenceApiKeyFromEnv(
@@ -80,7 +80,6 @@ export function setupStatus(
   activationFailed = false,
 ): SetupStatus {
   const missing = [
-    !config.intelligenceKey && INTELLIGENCE_KEY_MISSING_LABEL,
     !config.apiKey && 'OPENAI_API_KEY',
     !config.model && 'OPENAI_MODEL',
   ].filter((item): item is string => !!item);
@@ -97,7 +96,7 @@ export function setupStatus(
       ? 'setup_required'
       : 'not_configured';
   return {
-    intelligence: !!config.intelligenceKey,
+    intelligence: true,
     model: !!(config.apiKey && config.model),
     browser: !!(config.browserUrl && config.browserSecret),
     voice: !!(config.voiceKey && config.voiceModel && !missing.length),

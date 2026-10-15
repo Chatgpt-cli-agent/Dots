@@ -58,16 +58,28 @@ export function validateRuntimeScope(
     methods = ['PATCH', 'DELETE'];
   } else return deny();
   if (!methods.includes(request.method)) return deny();
+  const resolveDotId = (candidate: string): string | undefined => {
+    if (workspace.dot(candidate)) return candidate;
+    if (candidate.startsWith('chat-')) {
+      const thread = workspace
+        .conversations()
+        .find((t) => t.id === candidate.slice(5));
+      if (thread && workspace.dot(thread.dotId)) return thread.dotId;
+    }
+    return undefined;
+  };
+
   const bodyAgent = typeof data.agentId === 'string' ? data.agentId : undefined;
   const queryAgent = url.searchParams.get('agentId') ?? undefined;
+  let resolvedAgentDotId: string | undefined;
   for (const candidate of [agentId, bodyAgent, queryAgent]) {
-    if (
-      candidate &&
-      (!workspace.dot(candidate) || (agentId && candidate !== agentId))
-    )
-      return deny();
+    if (candidate) {
+      const resolved = resolveDotId(candidate);
+      if (!resolved) return deny();
+      if (resolvedAgentDotId && resolved !== resolvedAgentDotId) return deny();
+      resolvedAgentDotId = resolved;
+    }
   }
-  agentId ??= bodyAgent ?? queryAgent;
   for (const candidate of [
     threadId,
     typeof data.threadId === 'string' ? data.threadId : undefined,
@@ -75,7 +87,7 @@ export function validateRuntimeScope(
   ]) {
     if (candidate) {
       if (threadId && candidate !== threadId) return deny();
-      workspace.requireThread(candidate, agentId);
+      workspace.requireThread(candidate, resolvedAgentDotId);
     }
   }
 }

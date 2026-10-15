@@ -120,81 +120,92 @@ export async function parallelSources(
   signal: AbortSignal,
 ): Promise<WebSource[]> {
   signal.throwIfAborted();
-  if ((config.webSearchProvider ?? 'parallel') !== 'parallel')
-    throw new Error('Parallel web research is disabled.');
-  const client = new Client({ name: 'opendots', version: '0.1.0' });
-  const boundedSignal = AbortSignal.any([signal, AbortSignal.timeout(60_000)]);
-  const transport = new StreamableHTTPClientTransport(
-    new URL('https://search.parallel.ai/mcp'),
-    {
-      requestInit: config.parallelApiKey
-        ? { headers: { Authorization: `Bearer ${config.parallelApiKey}` } }
-        : undefined,
-      fetch: (url, init) =>
-        fetch(url, {
-          ...init,
-          signal: AbortSignal.any([
-            boundedSignal,
-            ...(init?.signal ? [init.signal] : []),
-          ]),
-        }),
-    },
-  );
-  const session_id = request.sessionId ?? randomUUID();
-  // Send only the requested research objective and URLs, never memories or the full transcript.
-  const objective = request.objective;
-  const search_queries = request.searchQueries ?? [objective];
-  const warn = request.onWarning ?? (() => {});
-  try {
-    await client.connect(transport);
-    let urls = request.urls;
-    if (!urls?.length) {
-      const found = sourcesFromResult(
-        await client.callTool(
-          {
-            name: 'web_search',
-            arguments: { objective, search_queries, session_id },
-          },
-          undefined,
-          { signal: boundedSignal },
-        ),
-        warn,
-      );
-      urls = found.map((page) => page.url);
-      if (!urls.length)
-        throw new Error(
-          'Parallel found no usable sources. Try a more specific research request.',
-        );
+  if (config.webSearchProvider === 'disabled')
+    throw new Error('Web research is disabled.');
+
+  // If specific URLs are provided (read_public_page)
+  if (request.urls && request.urls.length > 0) {
+    const results: WebSource[] = [];
+    for (const rawUrl of request.urls.slice(0, 5)) {
+      try {
+        const fetchSignal = AbortSignal.any([signal, AbortSignal.timeout(12000)]);
+        const res = await fetch(rawUrl, {
+          signal: fetchSignal,
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+        });
+        if (!res.ok) continue;
+        const html = await res.text();
+        const text = html
+          .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
+          .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        results.push({
+          title: rawUrl,
+          url: rawUrl,
+          text: text.slice(0, 6000),
+        });
+      } catch {
+        // Skip failed URLs
+      }
     }
-    for (const url of urls) source.shape.url.parse(url);
-    const pages = sourcesFromResult(
-      await client.callTool(
-        {
-          name: 'web_fetch',
-          arguments: {
-            urls: urls.slice(0, 5),
-            objective:
-              objective.length <= 200
-                ? objective
-                : 'Extract source evidence relevant to the supplied research queries.',
-            search_queries,
-            session_id,
-          },
-        },
-        undefined,
-        { signal: boundedSignal },
-      ),
-      warn,
-    );
-    if (urls.length > 5)
-      warn('Only the first five URLs were read; coverage is limited.');
-    if (pages.length < Math.min(urls.length, 5))
-      warn('Some requested sources could not be read; coverage is incomplete.');
-    boundedSignal.throwIfAborted();
-    if (!pages.length)
-      throw new Error('Parallel could not extract usable source evidence.');
-    return pages;
-  } finally {
-    await client.close().catch(() => {});
+    if (results.length > 0) return results;
   }
+
+  // Web search queries (SearXNG on port 8888, with DuckDuckGo engine)
+  const queries = request.searchQueries?.length ? request.searchQueries : [request.objective];
+  const query = queries[0] || request.objective;
+  const searxUrl = `http://127.0.0.1:8888/search?q=${encodeURIComponent(query)}&format=json`;
+
+  try {
+    const fetchSignal = AbortSignal.any([signal, AbortSignal.timeout(8000)]);
+    const res = await fetch(searxUrl, {
+      signal: fetchSignal,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+    });
+    if (res.ok) {
+      const data = (await res.json()) as any;
+      const hits = (data.results || []).slice(0, 5);
+      if (hits.length > 0) {
+        return hits.map((r: any) => ({
+          title: r.title || r.url,
+          url: r.url,
+          text: (r.content || r.title || '').slice(0, 2000),
+        }));
+      }
+    }
+  } catch {
+    // SearXNG error, fallback to DuckDuckGo
+  }
+
+  // Fallback: DuckDuckGo HTML
+  try {
+    const ddgUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    const fetchSignal = AbortSignal.any([signal, AbortSignal.timeout(8000)]);
+    const res = await fetch(ddgUrl, {
+      signal: fetchSignal,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+    });
+    if (res.ok) {
+      const html = await res.text();
+      const text = html
+        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
+        .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return [
+        {
+          title: `Search: ${query}`,
+          url: 'https://duckduckgo.com',
+          text: text.slice(0, 3000),
+        },
+      ];
+    }
+  } catch {
+    // Silent
+  }
+
+  return [];
 }

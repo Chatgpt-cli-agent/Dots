@@ -24,7 +24,8 @@ export class WorkspaceStore {
       CREATE TABLE IF NOT EXISTS thread_bindings(id TEXT PRIMARY KEY, dotId TEXT NOT NULL, ownerId TEXT NOT NULL, title TEXT NOT NULL, createdAt INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS task_threads(taskId TEXT PRIMARY KEY, threadId TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS calls(id TEXT PRIMARY KEY, threadId TEXT NOT NULL, startedAt INTEGER NOT NULL, endedAt INTEGER, status TEXT NOT NULL, transcript TEXT NOT NULL, error TEXT);
-      CREATE TABLE IF NOT EXISTS captures(threadId TEXT PRIMARY KEY, value TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS captures(threadId TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS thread_messages(id TEXT PRIMARY KEY, threadId TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, createdAt INTEGER NOT NULL);`);
     for (const [table, column, definition] of [
       ['dots', 'learningContainerId', 'TEXT'],
       ['dots', 'skillDeliveryEnabled', 'INTEGER NOT NULL DEFAULT 0'],
@@ -396,5 +397,27 @@ export class WorkspaceStore {
       .prepare('SELECT value FROM captures WHERE threadId=?')
       .get(threadId);
     return typeof row?.value === 'string' ? JSON.parse(row.value) : null;
+  }
+  saveMessage(threadId: string, role: string, content: unknown) {
+    const text = typeof content === 'string' ? content : JSON.stringify(content);
+    this.db
+      .prepare(
+        'INSERT INTO thread_messages (id, threadId, role, content, createdAt) VALUES (?, ?, ?, ?, ?)',
+      )
+      .run(randomUUID(), threadId, role, text, Date.now());
+  }
+  getMessages(threadId: string): { role: string; content?: unknown }[] {
+    const rows = this.db
+      .prepare(
+        'SELECT role, content FROM thread_messages WHERE threadId=? ORDER BY createdAt ASC',
+      )
+      .all(threadId) as unknown as { role: string; content: string }[];
+    return rows.map((r) => {
+      let parsed: unknown = r.content;
+      try {
+        parsed = JSON.parse(r.content);
+      } catch {}
+      return { role: r.role, content: parsed };
+    });
   }
 }
