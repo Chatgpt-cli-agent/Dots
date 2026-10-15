@@ -1,7 +1,12 @@
 import { InMemoryAgentRunner, type AgentRunnerRunRequest } from '@copilotkit/runtime/v2';
 import { EventType, type BaseEvent } from '@ag-ui/core';
 import { Observable, ReplaySubject } from 'rxjs';
-import type { WorkspaceStore, NativeMessage } from './workspace.js';
+import { randomUUID } from 'node:crypto';
+import {
+  type WorkspaceStore,
+  type NativeMessage,
+  formatMessageForAGUI,
+} from './workspace.js';
 import { globalRunCoordinator, RunCoordinator } from './run-coordinator.js';
 
 export interface NativeAgentRunnerOptions {
@@ -27,26 +32,9 @@ export class NativeAgentRunner extends InMemoryAgentRunner {
     const threadId = request.threadId;
     const connectionSubject = new ReplaySubject<BaseEvent>(Infinity);
 
-    // 1. Load authoritative database messages from SQLite
+    // 1. Load authoritative database messages from SQLite formatted for AG-UI
     const rawMessages = this.workspace.getNativeMessages(threadId);
-    const messages = rawMessages.map((m: NativeMessage) => {
-      let content: unknown = m.content;
-      try {
-        if (m.role !== 'user' && m.role !== 'assistant') {
-          content = JSON.parse(m.content);
-        }
-      } catch {}
-
-      return {
-        id: m.id,
-        role: m.role,
-        content,
-        ...(m.toolCalls && m.toolCalls.length > 0
-          ? { toolCalls: m.toolCalls }
-          : {}),
-        ...(m.toolCallId ? { toolCallId: m.toolCallId } : {}),
-      };
-    });
+    const messages = rawMessages.map(formatMessageForAGUI);
 
     // 2. Emit MESSAGES_SNAPSHOT event
     connectionSubject.next({
@@ -63,14 +51,21 @@ export class NativeAgentRunner extends InMemoryAgentRunner {
     if (pendingApproval) {
       connectionSubject.next({
         type: EventType.RUN_FINISHED,
+        threadId,
+        runId: pendingApproval.runId || randomUUID(),
         outcome: {
           type: 'interrupt',
           interrupts: [
             {
               id: pendingApproval.id,
+              reason: `Approval required for ${pendingApproval.toolName}`,
               name: pendingApproval.toolName,
-              toolCallId: pendingApproval.toolCallId,
+              toolCallId: pendingApproval.toolCallId ?? undefined,
               args: pendingApproval.args,
+              metadata: {
+                name: pendingApproval.toolName,
+                args: pendingApproval.args,
+              },
             },
           ],
         },
@@ -115,22 +110,6 @@ export class NativeAgentRunner extends InMemoryAgentRunner {
   }
 
   override getThreadMessages(threadId: string): any[] {
-    return this.workspace.getNativeMessages(threadId).map((m) => {
-      let content: unknown = m.content;
-      try {
-        if (m.role !== 'user' && m.role !== 'assistant') {
-          content = JSON.parse(m.content);
-        }
-      } catch {}
-      return {
-        id: m.id,
-        role: m.role,
-        content,
-        ...(m.toolCalls && m.toolCalls.length > 0
-          ? { toolCalls: m.toolCalls }
-          : {}),
-        ...(m.toolCallId ? { toolCallId: m.toolCallId } : {}),
-      };
-    });
+    return this.workspace.getNativeMessages(threadId).map(formatMessageForAGUI);
   }
 }

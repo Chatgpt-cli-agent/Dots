@@ -137,7 +137,7 @@ export class DotAgent extends AbstractAgent {
         );
 
         // Atomic run ownership & cancellation coordination
-        this.workspace.cancelActiveRuns(input.threadId);
+        this.workspace.cancelActiveRuns(input.threadId, undefined, input.runId);
         globalRunCoordinator.register(input.threadId, input.runId, dot.id, controller, this);
 
         // Persist incoming messages before execution
@@ -724,59 +724,93 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
                     const toolCallId = (event as any).toolCallId || randomUUID();
                     const toolName =
                       (event as any).toolCallName || (event as any).name || 'tool';
+                    const isApproval =
+                      [pageReviewTool.name, connectionActionTool.name].includes(toolName) ||
+                      clientTools.some((t) => t.name === toolName);
                     this.workspace.createToolExecution({
                       runId: runRecord.id,
                       threadId: input.threadId,
                       toolCallId,
                       toolName,
                       args: {},
-                      status: 'pending',
+                      approvalRequired: isApproval,
+                      status: isApproval ? 'awaiting_approval' : 'pending',
                     });
+                  } else if (event.type === EventType.TOOL_CALL_END) {
+                    const toolCallId = (event as any).toolCallId;
+                    if (toolCallId) {
+                      const tc = accumulator.getToolCalls().find((t) => t.toolCallId === toolCallId);
+                      let parsedArgs: Record<string, unknown> = {};
+                      if (tc?.argsString) {
+                        try {
+                          parsedArgs = JSON.parse(tc.argsString);
+                        } catch {
+                          parsedArgs = { raw: tc.argsString };
+                        }
+                      }
+                      this.workspace.updateToolExecutionByCallId(toolCallId, {
+                        args: parsedArgs,
+                      });
+
+                      // Persist parent assistant message with tool calls
+                      const allMsgs = accumulator.getMessages();
+                      const parent = allMsgs.find(
+                        (m) => m.role === 'assistant' && m.toolCalls?.some((c) => c.id === toolCallId),
+                      );
+                      if (parent) {
+                        try {
+                          this.workspace.saveMessage(
+                            input.threadId,
+                            'assistant',
+                            parent.content ?? '',
+                            {
+                              id: parent.id,
+                              runId: runRecord.id,
+                              toolCalls: parent.toolCalls,
+                            },
+                          );
+                        } catch {}
+                      }
+                    }
                   } else if (event.type === EventType.TOOL_CALL_RESULT) {
                     const toolCallId = (event as any).toolCallId;
                     if (toolCallId) {
                       this.workspace.updateToolExecutionByCallId(toolCallId, {
                         status: 'completed',
                         result: (event as any).content,
+                        approved: true,
                         finishedAt: Date.now(),
                       });
                     }
+                    const contentStr =
+                      typeof (event as any).content === 'string'
+                        ? (event as any).content
+                        : JSON.stringify((event as any).content ?? '');
+                    try {
+                      this.workspace.saveMessage(input.threadId, 'tool', contentStr, {
+                        id: (event as any).messageId || randomUUID(),
+                        toolCallId: (event as any).toolCallId,
+                        runId: runRecord?.id,
+                      });
+                    } catch {}
                   }
                 }
-
-                const formatToolCalls = (
-                  calls?: Array<{
-                    id: string;
-                    function: { name: string; arguments: string };
-                  }>,
-                ) =>
-                  calls?.map((tc) => ({
-                    id: tc.id,
-                    name: tc.function.name,
-                    args: (() => {
-                      try {
-                        return JSON.parse(tc.function.arguments || '{}');
-                      } catch {
-                        return tc.function.arguments;
-                      }
-                    })(),
-                  }));
 
                 // Save assistant message on TEXT_MESSAGE_END boundary
                 if (event.type === EventType.TEXT_MESSAGE_END) {
                   const messageId = (event as any).messageId;
                   const allMsgs = accumulator.getMessages();
                   const target = allMsgs.find((m) => m.id === messageId);
-                  if (target && target.content) {
+                  if (target) {
                     try {
                       this.workspace.saveMessage(
                         input.threadId,
                         'assistant',
-                        target.content,
+                        target.content ?? '',
                         {
                           id: target.id,
                           runId: runRecord?.id,
-                          toolCalls: formatToolCalls(target.toolCalls),
+                          toolCalls: target.toolCalls,
                         },
                       );
                     } catch {}
@@ -803,6 +837,7 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
                         if (existing) {
                           this.workspace.updateToolExecution(existing.id, {
                             status: 'awaiting_approval',
+                            approvalRequired: true,
                             args: intr.args || existing.args,
                           });
                         } else {
@@ -813,33 +848,76 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
                             toolCallId: intr.toolCallId,
                             toolName: intr.name,
                             args: intr.args || {},
+                            approvalRequired: true,
                             status: 'awaiting_approval',
                           });
                         }
                       }
                     }
 
-                    // Save any assistant messages that were not yet saved
-                    const completedMessages = accumulator.getMessages();
-                    const existingNative = this.workspace.getNativeMessages(input.threadId);
-                    for (const m of completedMessages) {
-                      if (m.role === 'assistant' && m.content) {
-                        const alreadySaved = existingNative.some((e) => e.id === m.id);
-                        if (!alreadySaved) {
-                          try {
-                            this.workspace.saveMessage(
-                              input.threadId,
-                              'assistant',
-                              m.content,
-                              {
-                                id: m.id,
-                                runId: runRecord?.id,
-                                toolCalls: formatToolCalls(m.toolCalls),
-                              },
-                            );
-                          } catch {}
+                    // Also check for pending client approval tools that returned without an interrupt outcome
+                    const runExecutions = this.workspace.getToolExecutions(input.threadId);
+                    for (const exec of runExecutions) {
+                      if (
+                        exec.runId === runRecord?.id &&
+                        exec.status !== 'completed' &&
+                        exec.status !== 'failed'
+                      ) {
+                        const isApproval =
+                          exec.approvalRequired ||
+                          [pageReviewTool.name, connectionActionTool.name].includes(exec.toolName) ||
+                          clientTools.some((t) => t.name === exec.toolName);
+                        if (isApproval) {
+                          let finalArgs = exec.args;
+                          if (!finalArgs || Object.keys(finalArgs).length === 0) {
+                            const tc = accumulator
+                              .getToolCalls()
+                              .find((t) => t.toolCallId === exec.toolCallId);
+                            if (tc?.argsString) {
+                              try {
+                                finalArgs = JSON.parse(tc.argsString);
+                              } catch {
+                                finalArgs = { raw: tc.argsString };
+                              }
+                            }
+                          }
+                          this.workspace.updateToolExecution(exec.id, {
+                            status: 'awaiting_approval',
+                            approvalRequired: true,
+                            args: finalArgs,
+                          });
                         }
                       }
+                    }
+
+                    // Save all canonical messages from accumulator to SQLite
+                    const completedMessages = accumulator.getMessages();
+                    for (const m of completedMessages) {
+                      try {
+                        if (m.role === 'assistant') {
+                          this.workspace.saveMessage(
+                            input.threadId,
+                            'assistant',
+                            m.content ?? '',
+                            {
+                              id: m.id,
+                              runId: runRecord?.id,
+                              toolCalls: m.toolCalls,
+                            },
+                          );
+                        } else if (m.role === 'tool') {
+                          this.workspace.saveMessage(
+                            input.threadId,
+                            'tool',
+                            m.content ?? '',
+                            {
+                              id: m.id,
+                              runId: runRecord?.id,
+                              toolCallId: m.toolCallId,
+                            },
+                          );
+                        }
+                      } catch {}
                     }
 
                     if (runRecord) {

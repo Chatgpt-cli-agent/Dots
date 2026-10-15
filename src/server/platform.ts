@@ -18,7 +18,7 @@ import { scheduledTaskMessagePrefix } from '../shared/scheduled-message.js';
 import { createSlackChannel } from './slack-channel.js';
 export { slackIdentity } from './slack-channel.js';
 import { Store } from './store.js';
-import { WorkspaceStore } from './workspace.js';
+import { WorkspaceStore, formatMessageForAGUI } from './workspace.js';
 import { DotAgent } from './dot-agent.js';
 import { runThreadTurn } from './headless.js';
 import {
@@ -312,24 +312,10 @@ export class Platform {
       const threadId = messagesMatch[1];
       if (method === 'GET') {
         const rawMessages = this.workspace.getNativeMessages(threadId);
-        const messages = rawMessages.map((m) => {
-          let content: unknown = m.content;
-          try {
-            if (m.role !== 'user' && m.role !== 'assistant') {
-              content = JSON.parse(m.content);
-            }
-          } catch {}
-          return {
-            id: m.id,
-            role: m.role,
-            content,
-            createdAt: new Date(m.createdAt).toISOString(),
-            ...(m.toolCalls && m.toolCalls.length > 0
-              ? { toolCalls: m.toolCalls }
-              : {}),
-            ...(m.toolCallId ? { toolCallId: m.toolCallId } : {}),
-          };
-        });
+        const messages = rawMessages.map((m) => ({
+          ...formatMessageForAGUI(m),
+          createdAt: new Date(m.createdAt).toISOString(),
+        }));
         return Response.json({ messages, nextCursor: null });
       }
       if (method === 'POST') {
@@ -519,6 +505,10 @@ export class Platform {
         );
       }
 
+      this.workspace.updateRun(run.id, {
+        status: 'completed',
+        finishedAt: Date.now(),
+      });
       this.workspace.touchThread(threadId);
       return assistantText;
     } catch (error) {

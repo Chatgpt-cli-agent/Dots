@@ -123,7 +123,7 @@ export class ProtocolAccumulator {
     // Tool call start
     if (type === EventType.TOOL_CALL_START) {
       const toolCallId = ev.toolCallId || randomUUID();
-      const toolName = ev.toolCallName || 'tool';
+      const toolName = ev.toolCallName || ev.name || 'tool';
       const parentMessageId = ev.parentMessageId;
       this.toolCalls.set(toolCallId, {
         toolCallId,
@@ -133,11 +133,25 @@ export class ProtocolAccumulator {
         parentMessageId,
       });
 
-      // Attach tool call to active/parent message
-      const targetMessageId = parentMessageId || this.activeMessageId;
-      if (targetMessageId && this.messageBuffers.has(targetMessageId)) {
-        const buf = this.messageBuffers.get(targetMessageId)!;
-        buf.toolCalls = buf.toolCalls || [];
+      // Attach tool call to active/parent message, creating an implicit assistant buffer if missing
+      let targetMessageId = parentMessageId || this.activeMessageId;
+      if (!targetMessageId) {
+        targetMessageId = randomUUID();
+        this.activeMessageId = targetMessageId;
+      }
+      if (!this.messageBuffers.has(targetMessageId)) {
+        this.messageBuffers.set(targetMessageId, {
+          id: targetMessageId,
+          role: 'assistant',
+          chunks: [],
+          completed: false,
+        });
+        this.messageOrder.push(targetMessageId);
+      }
+      const buf = this.messageBuffers.get(targetMessageId)!;
+      buf.toolCalls = buf.toolCalls || [];
+      const existingCall = buf.toolCalls.find((t) => t.id === toolCallId);
+      if (!existingCall) {
         buf.toolCalls.push({
           id: toolCallId,
           type: 'function',
@@ -161,11 +175,25 @@ export class ProtocolAccumulator {
       if (toolCallId && this.toolCalls.has(toolCallId) && delta) {
         const tc = this.toolCalls.get(toolCallId)!;
         tc.argsString += delta;
-        // Update in parent message
-        if (tc.parentMessageId && this.messageBuffers.has(tc.parentMessageId)) {
-          const buf = this.messageBuffers.get(tc.parentMessageId)!;
+        // Update in parent message buffer
+        let updated = false;
+        const targetMessageId = tc.parentMessageId || this.activeMessageId;
+        if (targetMessageId && this.messageBuffers.has(targetMessageId)) {
+          const buf = this.messageBuffers.get(targetMessageId)!;
           const match = buf.toolCalls?.find((t) => t.id === toolCallId);
-          if (match) match.function.arguments = tc.argsString;
+          if (match) {
+            match.function.arguments = tc.argsString;
+            updated = true;
+          }
+        }
+        if (!updated) {
+          for (const buf of this.messageBuffers.values()) {
+            const match = buf.toolCalls?.find((t) => t.id === toolCallId);
+            if (match) {
+              match.function.arguments = tc.argsString;
+              break;
+            }
+          }
         }
       }
       return;
@@ -173,7 +201,17 @@ export class ProtocolAccumulator {
 
     // Tool call end
     if (type === EventType.TOOL_CALL_END) {
-      // Tool call arguments fully sent
+      const toolCallId = ev.toolCallId;
+      if (toolCallId && this.toolCalls.has(toolCallId)) {
+        const tc = this.toolCalls.get(toolCallId)!;
+        for (const buf of this.messageBuffers.values()) {
+          const match = buf.toolCalls?.find((t) => t.id === toolCallId);
+          if (match) {
+            match.function.arguments = tc.argsString;
+            break;
+          }
+        }
+      }
       return;
     }
 
@@ -209,8 +247,8 @@ export class ProtocolAccumulator {
       const buf = this.messageBuffers.get(id);
       if (!buf) continue;
       const content = buf.chunks.join('');
-      // If message has content or toolCalls
-      if (content || (buf.toolCalls && buf.toolCalls.length > 0)) {
+      // If message has content or toolCalls or is role tool
+      if (content || (buf.toolCalls && buf.toolCalls.length > 0) || buf.role === 'tool') {
         result.push({
           id: buf.id,
           role: buf.role,

@@ -114,11 +114,17 @@ export interface Conversation {
 export interface NativeMessage {
   id: string;
   threadId: string;
-  role: 'user' | 'assistant' | 'system' | 'tool';
+  role: 'user' | 'assistant' | 'system' | 'tool' | 'developer';
   content: string;
   createdAt: number;
   runId?: string | null;
-  toolCalls?: Array<{ id: string; name: string; args: unknown }>;
+  toolCalls?: Array<{
+    id: string;
+    type?: 'function';
+    function?: { name: string; arguments: string };
+    name?: string;
+    args?: unknown;
+  }>;
   toolCallId?: string | null;
   status?: 'pending' | 'success' | 'failed' | 'cancelled';
   metadata?: Record<string, unknown> | null;

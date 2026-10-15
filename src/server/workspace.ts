@@ -17,6 +17,89 @@ import type {
   Space,
 } from '../shared/types.js';
 export type { NativeMessage, NativeRun, NativeToolExecution };
+
+export interface AGUIToolCall {
+  id: string;
+  type: 'function';
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
+export function toAGUIToolCalls(calls: unknown): AGUIToolCall[] {
+  if (!Array.isArray(calls)) return [];
+  return calls.map((tc: any) => {
+    const id = String(tc.id || randomUUID());
+    let name = '';
+    let argsStr = '{}';
+    if (tc.type === 'function' && tc.function) {
+      name = String(tc.function.name || '');
+      argsStr =
+        typeof tc.function.arguments === 'string'
+          ? tc.function.arguments
+          : JSON.stringify(tc.function.arguments ?? {});
+    } else {
+      name = String(tc.name || tc.toolName || tc.function?.name || '');
+      const rawArgs = tc.args ?? tc.arguments ?? tc.function?.arguments ?? {};
+      argsStr = typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs);
+    }
+    return {
+      id,
+      type: 'function' as const,
+      function: {
+        name,
+        arguments: argsStr,
+      },
+    };
+  });
+}
+
+export function formatMessageForAGUI(m: {
+  id: string;
+  role: string;
+  content: unknown;
+  toolCalls?: unknown;
+  toolCallId?: string | null;
+  createdAt?: number;
+}) {
+  const role = m.role;
+  const contentStr =
+    typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
+
+  if (role === 'assistant') {
+    const toolCalls = toAGUIToolCalls(m.toolCalls);
+    return {
+      id: m.id,
+      role: 'assistant' as const,
+      content: contentStr,
+      ...(toolCalls.length > 0 ? { toolCalls } : {}),
+    };
+  }
+
+  if (role === 'tool') {
+    return {
+      id: m.id,
+      role: 'tool' as const,
+      content: contentStr,
+      toolCallId: String(m.toolCallId || m.id),
+    };
+  }
+
+  if (role === 'developer' || role === 'system') {
+    return {
+      id: m.id,
+      role: role as 'developer' | 'system',
+      content: contentStr,
+    };
+  }
+
+  return {
+    id: m.id,
+    role: 'user' as const,
+    content: contentStr,
+  };
+}
 export class WorkspaceStore {
   private db: DatabaseSync;
   readonly pages: Pages;
@@ -551,7 +634,13 @@ export class WorkspaceStore {
     options?: {
       id?: string;
       runId?: string | null;
-      toolCalls?: Array<{ id: string; name: string; args: unknown }>;
+      toolCalls?: Array<{
+        id: string;
+        name?: string;
+        args?: unknown;
+        type?: 'function';
+        function?: { name: string; arguments: string };
+      }>;
       toolCallId?: string | null;
       status?: 'pending' | 'success' | 'failed' | 'cancelled';
       metadata?: Record<string, unknown> | null;
@@ -562,7 +651,8 @@ export class WorkspaceStore {
     const text = typeof content === 'string' ? content : JSON.stringify(content);
     const createdAt = options?.createdAt || Date.now();
     const runId = options?.runId ?? null;
-    const toolCalls = options?.toolCalls ? JSON.stringify(options.toolCalls) : null;
+    const formattedToolCalls = options?.toolCalls ? toAGUIToolCalls(options.toolCalls) : undefined;
+    const toolCalls = formattedToolCalls ? JSON.stringify(formattedToolCalls) : null;
     const toolCallId = options?.toolCallId ?? null;
     const status = options?.status ?? null;
     const metadata = options?.metadata ? JSON.stringify(options.metadata) : null;
@@ -603,7 +693,7 @@ export class WorkspaceStore {
       content: text,
       createdAt,
       runId,
-      toolCalls: options?.toolCalls,
+      toolCalls: formattedToolCalls,
       toolCallId,
       status: options?.status,
       metadata: options?.metadata,
@@ -623,7 +713,7 @@ export class WorkspaceStore {
       content: String(r.content),
       createdAt: Number(r.createdAt),
       runId: r.runId ? String(r.runId) : null,
-      toolCalls: r.toolCalls ? JSON.parse(r.toolCalls) : undefined,
+      toolCalls: r.toolCalls ? toAGUIToolCalls(JSON.parse(r.toolCalls)) : undefined,
       toolCallId: r.toolCallId ? String(r.toolCallId) : null,
       status: r.status ? (r.status as NativeMessage['status']) : undefined,
       metadata: r.metadata ? JSON.parse(r.metadata) : null,
@@ -788,13 +878,38 @@ export class WorkspaceStore {
     };
   }
 
-  cancelActiveRuns(threadId: string, error = 'Run cancelled.') {
-    globalRunCoordinator.cancelThread(threadId, error);
-    this.db
-      .prepare(
-        "UPDATE runs SET status='cancelled', error=?, finishedAt=? WHERE threadId=? AND status IN ('queued', 'running')",
-      )
-      .run(error, Date.now(), threadId);
+  getRuns(threadId: string): NativeRun[] {
+    const rows = this.db
+      .prepare('SELECT * FROM runs WHERE threadId=? ORDER BY startedAt DESC')
+      .all(threadId) as any[];
+    return rows.map((row) => ({
+      id: String(row.id),
+      threadId: String(row.threadId),
+      dotId: String(row.dotId),
+      parentRunId: row.parentRunId ? String(row.parentRunId) : null,
+      status: row.status as NativeRun['status'],
+      error: row.error ? String(row.error) : null,
+      startedAt: Number(row.startedAt),
+      finishedAt: row.finishedAt ? Number(row.finishedAt) : null,
+      metadata: row.metadata ? JSON.parse(row.metadata) : null,
+    }));
+  }
+
+  cancelActiveRuns(threadId: string, error = 'Run cancelled.', excludeRunId?: string) {
+    globalRunCoordinator.cancelThread(threadId, error, excludeRunId);
+    if (excludeRunId) {
+      this.db
+        .prepare(
+          "UPDATE runs SET status='cancelled', error=?, finishedAt=? WHERE threadId=? AND status IN ('queued', 'running') AND id != ?",
+        )
+        .run(error, Date.now(), threadId, excludeRunId);
+    } else {
+      this.db
+        .prepare(
+          "UPDATE runs SET status='cancelled', error=?, finishedAt=? WHERE threadId=? AND status IN ('queued', 'running')",
+        )
+        .run(error, Date.now(), threadId);
+    }
   }
 
   createToolExecution(execution: {
@@ -847,7 +962,7 @@ export class WorkspaceStore {
     patch: Partial<
       Pick<
         NativeToolExecution,
-        'result' | 'status' | 'approved' | 'error' | 'finishedAt' | 'args'
+        'result' | 'status' | 'approved' | 'approvalRequired' | 'error' | 'finishedAt' | 'args'
       >
     >,
   ): NativeToolExecution {
@@ -863,6 +978,8 @@ export class WorkspaceStore {
     const status = patch.status ?? current.status;
     const approved =
       patch.approved !== undefined ? patch.approved : current.approved;
+    const approvalRequired =
+      patch.approvalRequired !== undefined ? patch.approvalRequired : current.approvalRequired;
     const error = patch.error !== undefined ? patch.error : current.error;
     const finishedAt =
       patch.finishedAt !== undefined ? patch.finishedAt : current.finishedAt;
@@ -871,9 +988,9 @@ export class WorkspaceStore {
 
     this.db
       .prepare(
-        'UPDATE tool_executions SET result=?, status=?, approved=?, error=?, finishedAt=?, args=COALESCE(?, args) WHERE id=?',
+        'UPDATE tool_executions SET result=?, status=?, approved=?, approvalRequired=?, error=?, finishedAt=?, args=COALESCE(?, args) WHERE id=?',
       )
-      .run(resultStr ?? null, status, approved ? 1 : 0, error ?? null, finishedAt ?? null, argsStr, id);
+      .run(resultStr ?? null, status, approved ? 1 : 0, approvalRequired ? 1 : 0, error ?? null, finishedAt ?? null, argsStr, id);
 
     return {
       ...current,
@@ -881,6 +998,7 @@ export class WorkspaceStore {
       result,
       status,
       approved,
+      approvalRequired,
       error,
       finishedAt,
     };

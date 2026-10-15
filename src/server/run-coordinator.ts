@@ -22,8 +22,8 @@ export class RunCoordinator {
     abortController: AbortController,
     agent?: { abortRun(): void },
   ): ActiveRun {
-    // Cancel any prior active run on this thread
-    this.cancelThread(threadId, 'Superseded by a new run on this thread.');
+    // Cancel any prior active run on this thread, excluding this runId
+    this.cancelThread(threadId, 'Superseded by a new run on this thread.', runId);
 
     const activeRun: ActiveRun = {
       runId,
@@ -68,9 +68,14 @@ export class RunCoordinator {
     }
   }
 
-  cancelThread(threadId: string, reason = 'Run cancelled.'): boolean {
+  cancelThread(
+    threadId: string,
+    reason = 'Run cancelled.',
+    excludeRunId?: string,
+  ): boolean {
     const existing = this.activeRunsByThread.get(threadId);
     if (!existing) return false;
+    if (excludeRunId && existing.runId === excludeRunId) return false;
 
     this.activeRunsByThread.delete(threadId);
     this.activeRunsById.delete(existing.runId);

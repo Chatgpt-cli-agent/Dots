@@ -5,11 +5,13 @@ import { Store } from '../src/server/store.js';
 import { WorkspaceStore } from '../src/server/workspace.js';
 import { Platform } from '../src/server/platform.js';
 import { ComputerService } from '../src/server/computer-service.js';
-import { EventType } from '@ag-ui/core';
-import { lastValueFrom, toArray } from 'rxjs';
+import { EventType, MessagesSnapshotEventSchema, RunFinishedEventSchema } from '@ag-ui/core';
+import { lastValueFrom, toArray, Observable } from 'rxjs';
 import { ProtocolAccumulator } from '../src/server/protocol-accumulator.js';
 import { NativeAgentRunner } from '../src/server/native-runner.js';
 import { RunCoordinator, globalRunCoordinator } from '../src/server/run-coordinator.js';
+import { DotAgent } from '../src/server/dot-agent.js';
+import { BuiltInAgent } from '@copilotkit/runtime/v2';
 import type { PlatformConfig } from '../src/server/platform-config.js';
 
 const resources: (() => void)[] = [];
@@ -456,7 +458,7 @@ it('reconnects and replays durable SQLite history and pending approvals via Nati
     nativeRunner.connect({ threadId: thread.id }).pipe(toArray()),
   );
 
-  // 1. MESSAGES_SNAPSHOT event emitted with authoritative history
+  // 1. MESSAGES_SNAPSHOT event emitted with authoritative history and validates against AG-UI schema
   const snapshotEvent = events.find((e: any) => e.type === EventType.MESSAGES_SNAPSHOT) as any;
   expect(snapshotEvent).toBeDefined();
   expect(snapshotEvent.messages).toHaveLength(2);
@@ -470,8 +472,9 @@ it('reconnects and replays durable SQLite history and pending approvals via Nati
     role: 'assistant',
     content: 'Here is the plan: deploy to prod.',
   });
+  expect(MessagesSnapshotEventSchema.safeParse(snapshotEvent).success).toBe(true);
 
-  // 2. Pending approval interrupt event emitted
+  // 2. Pending approval interrupt event emitted and validates against AG-UI schema
   const interruptEvent = events.find(
     (e: any) => e.type === EventType.RUN_FINISHED && e.outcome?.type === 'interrupt',
   ) as any;
@@ -481,6 +484,7 @@ it('reconnects and replays durable SQLite history and pending approvals via Nati
     name: 'request_connection_action',
     toolCallId: 'call-deploy-1',
   });
+  expect(RunFinishedEventSchema.safeParse(interruptEvent).success).toBe(true);
 });
 
 it('coordinates atomic run cancellation and guards against terminal status overwrites', () => {
@@ -580,5 +584,368 @@ it('supports per-Dot model configuration and sanitizes stored API keys', () => {
   expect(updated.modelEndpoint).toBe('http://192.168.1.100:11434/v1');
   expect(updated.contextLimit).toBe(32768);
   expect(workspace.dot(customDot.id, true)?.apiKey).toBe('new-secret-999');
+});
+
+it('persists complete tool transcripts (assistant tool call + tool result) and replays valid AG-UI snapshots', async () => {
+  const dbPath = createTestDbPath();
+  const store = new Store(':memory:');
+  const workspace = new WorkspaceStore(dbPath, 'owner-1');
+  resources.push(() => {
+    store.close();
+    workspace.close();
+  });
+
+  const dot = workspace.dots()[0];
+  const thread = workspace.bindThread('thread-tool-transcript', dot.id, 'Tool Transcript Thread');
+  workspace.saveMessage(thread.id, 'user', 'List my authorized spaces');
+
+  const config: PlatformConfig = {
+    baseUrl: 'http://127.0.0.1:11434/v1',
+    nativeMode: true,
+    voiceName: 'marin',
+    slackUsers: [],
+    model: 'default-model',
+    runtimeUrl: 'http://localhost/api/copilotkit',
+  };
+
+  const agent = new DotAgent(store, workspace, config, dot.id);
+  const runId = 'run-tool-test-1';
+
+  // Mock inner BuiltInAgent to stream a tool call turn followed by a tool result
+  const mockEvents = [
+    { type: EventType.RUN_STARTED, threadId: thread.id, runId },
+    {
+      type: EventType.TOOL_CALL_START,
+      toolCallId: 'tc-list-spaces-1',
+      toolCallName: 'list_authorized_spaces',
+      parentMessageId: 'asst-msg-tool-1',
+    },
+    {
+      type: EventType.TOOL_CALL_ARGS,
+      toolCallId: 'tc-list-spaces-1',
+      delta: '{"filter":',
+    },
+    {
+      type: EventType.TOOL_CALL_ARGS,
+      toolCallId: 'tc-list-spaces-1',
+      delta: '"all"}',
+    },
+    { type: EventType.TOOL_CALL_END, toolCallId: 'tc-list-spaces-1' },
+    {
+      type: EventType.TOOL_CALL_RESULT,
+      toolCallId: 'tc-list-spaces-1',
+      messageId: 'tool-msg-1',
+      content: JSON.stringify([{ id: 'space-1', name: 'General' }]),
+    },
+    {
+      type: EventType.TEXT_MESSAGE_START,
+      messageId: 'asst-msg-final-1',
+      role: 'assistant',
+    },
+    {
+      type: EventType.TEXT_MESSAGE_CONTENT,
+      messageId: 'asst-msg-final-1',
+      delta: 'Found space: General.',
+    },
+    { type: EventType.TEXT_MESSAGE_END, messageId: 'asst-msg-final-1' },
+    { type: EventType.RUN_FINISHED, threadId: thread.id, runId },
+  ];
+
+  vi.spyOn(BuiltInAgent.prototype, 'run').mockReturnValue(
+    new Observable((sub) => {
+      for (const ev of mockEvents) sub.next(ev as any);
+      sub.complete();
+    }),
+  );
+
+  const accumulator = new ProtocolAccumulator();
+  await lastValueFrom(
+    agent
+      .run({
+        runId,
+        threadId: thread.id,
+        messages: [{ id: 'user-1', role: 'user', content: 'List my authorized spaces' }] as any,
+        tools: [],
+        context: [],
+        state: {},
+        forwardedProps: {},
+      })
+      .pipe(toArray()),
+  );
+
+  // 1. Verify SQLite chat transcript contains the entire multi-turn tool interaction
+  const savedMessages = workspace.getNativeMessages(thread.id);
+  expect(savedMessages.length).toBeGreaterThanOrEqual(4);
+
+  const userMsg = savedMessages.find((m) => m.role === 'user');
+  expect(userMsg).toBeDefined();
+
+  const asstToolMsg = savedMessages.find(
+    (m) => m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0,
+  );
+  expect(asstToolMsg).toBeDefined();
+  expect(asstToolMsg?.toolCalls?.[0]).toMatchObject({
+    id: 'tc-list-spaces-1',
+    type: 'function',
+    function: {
+      name: 'list_authorized_spaces',
+      arguments: '{"filter":"all"}',
+    },
+  });
+
+  const toolResultMsg = savedMessages.find((m) => m.role === 'tool');
+  expect(toolResultMsg).toBeDefined();
+  expect(toolResultMsg?.toolCallId).toBe('tc-list-spaces-1');
+  expect(typeof toolResultMsg?.content).toBe('string');
+  expect(toolResultMsg?.content).toContain('space-1');
+
+  const finalAsstMsg = savedMessages.find(
+    (m) => m.role === 'assistant' && m.content.includes('Found space: General.'),
+  );
+  expect(finalAsstMsg).toBeDefined();
+
+  // 2. Replay via NativeAgentRunner.connect() and validate against AG-UI schema
+  const runner = new NativeAgentRunner({ workspace });
+  const replayedEvents = await lastValueFrom(
+    runner.connect({ threadId: thread.id }).pipe(toArray()),
+  );
+
+  const snapshotEvent = replayedEvents.find((e: any) => e.type === EventType.MESSAGES_SNAPSHOT) as any;
+  expect(snapshotEvent).toBeDefined();
+  const parseResult = MessagesSnapshotEventSchema.safeParse(snapshotEvent);
+  expect(parseResult.success).toBe(true);
+});
+
+it('tracks frontend review tool approvals without interrupt outcome and restores review state across reconnect', async () => {
+  const dbPath = createTestDbPath();
+  const store = new Store(':memory:');
+  const workspace = new WorkspaceStore(dbPath, 'owner-1');
+  resources.push(() => {
+    store.close();
+    workspace.close();
+  });
+
+  const dot = workspace.dots()[0];
+  const space = workspace.spaces()[0];
+  const thread = workspace.bindThread('thread-review-tool', dot.id, 'Page Review Thread');
+  workspace.saveMessage(thread.id, 'user', 'Create a new project roadmap page');
+
+  const config: PlatformConfig = {
+    baseUrl: 'http://127.0.0.1:11434/v1',
+    nativeMode: true,
+    voiceName: 'marin',
+    slackUsers: [],
+    model: 'default-model',
+    runtimeUrl: 'http://localhost/api/copilotkit',
+  };
+
+  const agent = new DotAgent(store, workspace, config, dot.id);
+  const runId = 'run-review-test-1';
+  const toolCallId = 'tc-review-draft-1';
+  const draftArgs = {
+    title: 'Project Roadmap 2026',
+    content: '# Roadmap\n1. Native core\n2. UI',
+    spaceId: space.id,
+  };
+
+  // TanStack/BuiltInAgent emits tool call without an interrupt outcome
+  const reviewEvents = [
+    { type: EventType.RUN_STARTED, threadId: thread.id, runId },
+    {
+      type: EventType.TOOL_CALL_START,
+      toolCallId,
+      toolCallName: 'review_space_page',
+      parentMessageId: 'asst-msg-review-1',
+    },
+    {
+      type: EventType.TOOL_CALL_ARGS,
+      toolCallId,
+      delta: JSON.stringify(draftArgs),
+    },
+    { type: EventType.TOOL_CALL_END, toolCallId },
+    { type: EventType.RUN_FINISHED, threadId: thread.id, runId, outcome: { type: 'success' } },
+  ];
+
+  vi.spyOn(BuiltInAgent.prototype, 'run').mockReturnValue(
+    new Observable((sub) => {
+      for (const ev of reviewEvents) sub.next(ev as any);
+      sub.complete();
+    }),
+  );
+
+  await lastValueFrom(
+    agent
+      .run({
+        runId,
+        threadId: thread.id,
+        messages: [{ id: 'user-1', role: 'user', content: 'Create a new project roadmap page' }] as any,
+        tools: [{ name: 'review_space_page', description: 'Review page', parameters: {} }] as any,
+        context: [],
+        state: {},
+        forwardedProps: {},
+      })
+      .pipe(toArray()),
+  );
+
+  // 1. Tool execution row is created with status 'awaiting_approval' and parsed draft args
+  const toolExecs = workspace.getToolExecutions(thread.id);
+  const reviewExec = toolExecs.find((e) => e.toolName === 'review_space_page');
+  expect(reviewExec).toBeDefined();
+  expect(reviewExec?.status).toBe('awaiting_approval');
+  expect(reviewExec?.approvalRequired).toBe(true);
+  expect(reviewExec?.args).toEqual(draftArgs);
+
+  // 2. Assistant message with the tool call is saved
+  const dbMsgs = workspace.getNativeMessages(thread.id);
+  const reviewMsg = dbMsgs.find(
+    (m) => m.role === 'assistant' && m.toolCalls?.some((c) => c.id === toolCallId),
+  );
+  expect(reviewMsg).toBeDefined();
+  expect(reviewMsg?.toolCalls?.[0].function?.name).toBe('review_space_page');
+
+  // 3. Connect via NativeAgentRunner (browser reconnect)
+  const runner = new NativeAgentRunner({ workspace });
+  const replayed = await lastValueFrom(
+    runner.connect({ threadId: thread.id }).pipe(toArray()),
+  );
+
+  const snapshot = replayed.find((e: any) => e.type === EventType.MESSAGES_SNAPSHOT) as any;
+  expect(snapshot).toBeDefined();
+  expect(MessagesSnapshotEventSchema.safeParse(snapshot).success).toBe(true);
+
+  const interrupt = replayed.find((e: any) => e.type === EventType.RUN_FINISHED && e.outcome?.type === 'interrupt') as any;
+  expect(interrupt).toBeDefined();
+  expect(RunFinishedEventSchema.safeParse(interrupt).success).toBe(true);
+  expect(interrupt.outcome.interrupts[0].toolCallId).toBe(toolCallId);
+
+  // 4. Approve the review
+  const pageResult = workspace.pages.createReviewed(
+    space.id,
+    { title: draftArgs.title, content: draftArgs.content },
+    thread.id,
+    toolCallId,
+  );
+  workspace.updateToolExecution(reviewExec!.id, {
+    status: 'completed',
+    approved: true,
+    result: { success: true, pageId: pageResult.id },
+  });
+  workspace.saveMessage(thread.id, 'tool', JSON.stringify({ success: true, pageId: pageResult.id }), {
+    toolCallId,
+  });
+
+  // Reconnect after approval: interrupt is no longer emitted
+  const reconnectedAfterApproval = await lastValueFrom(
+    runner.connect({ threadId: thread.id }).pipe(toArray()),
+  );
+  const postApprovalInterrupt = reconnectedAfterApproval.find(
+    (e: any) => e.type === EventType.RUN_FINISHED && e.outcome?.type === 'interrupt',
+  );
+  expect(postApprovalInterrupt).toBeUndefined();
+});
+
+it('verifies native turn and specialist delegation record run status as completed, not cancelled', async () => {
+  const dbPath = createTestDbPath();
+  const store = new Store(':memory:');
+  const workspace = new WorkspaceStore(dbPath, 'owner-1');
+  resources.push(() => {
+    store.close();
+    workspace.close();
+  });
+
+  const codingDot = workspace.dots()[0];
+  const space = workspace.spaces()[0];
+  const researchDot = workspace.createDot(
+    space.id,
+    'Research Specialist',
+    'Investigate specs',
+    true,
+    true,
+    [space.id],
+    undefined,
+    false,
+    true,
+    [],
+    'http://127.0.0.1:11434/v1',
+    'research-agent',
+  );
+
+  const config: PlatformConfig = {
+    baseUrl: 'http://127.0.0.1:11434/v1',
+    nativeMode: true,
+    voiceName: 'marin',
+    slackUsers: [],
+    model: 'default-model',
+    runtimeUrl: 'http://localhost/api/copilotkit',
+  };
+
+  const platform = new Platform(store, workspace, config);
+  const thread = await platform.createConversation(codingDot.id, 'Turn Status Thread');
+
+  // Spy on BuiltInAgent.run to return a successful streamed response
+  vi.spyOn(BuiltInAgent.prototype, 'run').mockImplementation(function (this: any, input: any) {
+    const threadId = input.threadId;
+    const runId = input.runId;
+    return new Observable((sub) => {
+      sub.next({ type: EventType.RUN_STARTED, threadId, runId } as any);
+      sub.next({
+        type: EventType.TEXT_MESSAGE_START,
+        messageId: 'msg-reply-1',
+        role: 'assistant',
+      } as any);
+      sub.next({
+        type: EventType.TEXT_MESSAGE_CONTENT,
+        messageId: 'msg-reply-1',
+        delta: 'Operation completed successfully.',
+      } as any);
+      sub.next({ type: EventType.TEXT_MESSAGE_END, messageId: 'msg-reply-1' } as any);
+      sub.next({ type: EventType.RUN_FINISHED, threadId, runId } as any);
+      sub.complete();
+    });
+  });
+
+  const controller = new AbortController();
+  const reply = await platform.runNativeTurn(thread.id, 'Execute my task', controller.signal);
+  expect(reply).toBe('Operation completed successfully.');
+
+  // Verify the run record in SQLite is COMPLETED (not cancelled!)
+  const runs = workspace.getRuns(thread.id);
+  expect(runs.length).toBeGreaterThanOrEqual(1);
+  const turnRun = runs[0];
+  expect(turnRun.status).toBe('completed');
+  expect(turnRun.error).toBeNull();
+
+  // Test delegation: child subRun must also complete with status 'completed'
+  const parentRun = workspace.createRun({
+    id: 'parent-delegation-run',
+    threadId: thread.id,
+    dotId: codingDot.id,
+  });
+
+  const subThreadId = `delegation-${parentRun.id}-test`;
+  workspace.bindThread(subThreadId, researchDot.id, 'Delegation sub-thread');
+  const childSubRun = workspace.createRun({
+    id: 'child-delegation-run',
+    threadId: subThreadId,
+    dotId: researchDot.id,
+    parentRunId: parentRun.id,
+  });
+
+  const childAgent = new DotAgent(store, workspace, config, researchDot.id);
+  await lastValueFrom(
+    childAgent.run({
+      runId: childSubRun.id,
+      threadId: subThreadId,
+      messages: [{ id: 'task-1', role: 'user', content: 'Analyze spec' }] as any,
+      tools: [],
+      context: [],
+      state: {},
+      forwardedProps: {},
+    }),
+  );
+
+  const updatedChildRun = workspace.getRun(childSubRun.id);
+  expect(updatedChildRun?.status).toBe('completed');
+  expect(updatedChildRun?.error).toBeNull();
 });
 
