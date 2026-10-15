@@ -44,8 +44,19 @@ export class NativeAgentRunner extends InMemoryAgentRunner {
 
     // 3. Check for any pending tool approval on this thread
     const pendingExecutions = this.workspace.getToolExecutions(threadId);
+    const hasToolResultForCall = (callId?: string | null) =>
+      !callId
+        ? false
+        : rawMessages.some(
+            (m) =>
+              m.role === 'tool' &&
+              (m.toolCallId === callId || (m as any).tool_call_id === callId),
+          );
     const pendingApproval = pendingExecutions.find(
-      (exec) => exec.status === 'awaiting_approval' && !exec.approved,
+      (exec) =>
+        exec.status === 'awaiting_approval' &&
+        !exec.approved &&
+        !hasToolResultForCall(exec.toolCallId),
     );
 
     if (pendingApproval) {

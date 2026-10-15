@@ -1027,13 +1027,63 @@ export class WorkspaceStore {
     patch: Partial<
       Pick<
         NativeToolExecution,
-        'result' | 'status' | 'approved' | 'error' | 'finishedAt' | 'args'
+        'result' | 'status' | 'approved' | 'approvalRequired' | 'error' | 'finishedAt' | 'args'
       >
     >,
   ): NativeToolExecution | null {
     const current = this.getToolExecutionByCallId(toolCallId);
     if (!current) return null;
     return this.updateToolExecution(current.id, patch);
+  }
+
+  resolveToolExecution(
+    threadId: string,
+    toolCallId: string,
+    options: {
+      result?: unknown;
+      approved?: boolean;
+      status?: NativeToolExecution['status'];
+      error?: string | null;
+      finishedAt?: number;
+    },
+  ): NativeToolExecution | null {
+    let row = this.db
+      .prepare(
+        'SELECT * FROM tool_executions WHERE threadId=? AND toolCallId=? ORDER BY createdAt DESC LIMIT 1',
+      )
+      .get(threadId, toolCallId) as any;
+    if (!row) {
+      row = this.db
+        .prepare(
+          'SELECT * FROM tool_executions WHERE toolCallId=? ORDER BY createdAt DESC LIMIT 1',
+        )
+        .get(toolCallId) as any;
+    }
+    if (!row) return null;
+
+    const current = this.mapToolExecutionRow(row);
+    const finishedAt = options.finishedAt ?? Date.now();
+    const approved =
+      options.approved !== undefined ? options.approved : current.approved;
+    const status = options.status ?? (approved ? 'completed' : 'rejected');
+    const result = options.result !== undefined ? options.result : current.result;
+    const resultStr = result !== undefined ? JSON.stringify(result) : null;
+    const error = (options.error !== undefined ? options.error : current.error) ?? null;
+
+    this.db
+      .prepare(
+        'UPDATE tool_executions SET status=?, approved=?, result=?, error=?, finishedAt=? WHERE id=?',
+      )
+      .run(status, approved ? 1 : 0, resultStr, error, finishedAt, current.id);
+
+    return {
+      ...current,
+      status,
+      approved,
+      result,
+      error,
+      finishedAt,
+    };
   }
 
   private mapToolExecutionRow(row: any): NativeToolExecution {

@@ -149,6 +149,7 @@ export class DotAgent extends AbstractAgent {
                 typeof msg.content === 'string'
                   ? msg.content
                   : JSON.stringify(msg.content ?? '');
+              const toolCallId = (msg as any).toolCallId || (msg as any).tool_call_id;
               const alreadySaved = existingMessages.some(
                 (m) =>
                   (msg.id && m.id === msg.id) ||
@@ -157,8 +158,33 @@ export class DotAgent extends AbstractAgent {
               if (!alreadySaved) {
                 this.workspace.saveMessage(input.threadId, msg.role, text, {
                   id: msg.id,
-                  toolCallId: (msg as any).toolCallId,
+                  toolCallId,
                   toolCalls: (msg as any).toolCalls,
+                });
+              }
+
+              // Atomically and idempotently resolve durable tool execution when tool result message arrives
+              if (msg.role === 'tool' && toolCallId) {
+                let parsedResult: any = msg.content;
+                if (typeof msg.content === 'string') {
+                  try {
+                    parsedResult = JSON.parse(msg.content);
+                  } catch {
+                    parsedResult = msg.content;
+                  }
+                }
+                const isDeclined =
+                  parsedResult && typeof parsedResult === 'object'
+                    ? parsedResult.approved === false ||
+                      parsedResult.declined === true ||
+                      parsedResult.rejected === true
+                    : false;
+
+                this.workspace.resolveToolExecution(input.threadId, toolCallId, {
+                  result: parsedResult,
+                  approved: !isDeclined,
+                  status: !isDeclined ? 'completed' : 'rejected',
+                  finishedAt: Date.now(),
                 });
               }
             }
@@ -775,10 +801,25 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
                   } else if (event.type === EventType.TOOL_CALL_RESULT) {
                     const toolCallId = (event as any).toolCallId;
                     if (toolCallId) {
-                      this.workspace.updateToolExecutionByCallId(toolCallId, {
-                        status: 'completed',
-                        result: (event as any).content,
-                        approved: true,
+                      let parsedResult: any = (event as any).content;
+                      if (typeof (event as any).content === 'string') {
+                        try {
+                          parsedResult = JSON.parse((event as any).content);
+                        } catch {
+                          parsedResult = (event as any).content;
+                        }
+                      }
+                      const isDeclined =
+                        parsedResult && typeof parsedResult === 'object'
+                          ? parsedResult.approved === false ||
+                            parsedResult.declined === true ||
+                            parsedResult.rejected === true
+                          : false;
+
+                      this.workspace.resolveToolExecution(input.threadId, toolCallId, {
+                        status: !isDeclined ? 'completed' : 'rejected',
+                        result: parsedResult,
+                        approved: !isDeclined,
                         finishedAt: Date.now(),
                       });
                     }

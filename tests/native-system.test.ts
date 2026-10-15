@@ -818,21 +818,64 @@ it('tracks frontend review tool approvals without interrupt outcome and restores
   expect(RunFinishedEventSchema.safeParse(interrupt).success).toBe(true);
   expect(interrupt.outcome.interrupts[0].toolCallId).toBe(toolCallId);
 
-  // 4. Approve the review
+  // 4. Continue execution with approval result submitted via input transcript (no manual DB status edits)
   const pageResult = workspace.pages.createReviewed(
     space.id,
     { title: draftArgs.title, content: draftArgs.content },
     thread.id,
     toolCallId,
   );
-  workspace.updateToolExecution(reviewExec!.id, {
-    status: 'completed',
-    approved: true,
-    result: { success: true, pageId: pageResult.id },
-  });
-  workspace.saveMessage(thread.id, 'tool', JSON.stringify({ success: true, pageId: pageResult.id }), {
-    toolCallId,
-  });
+  const approvalPayload = { success: true, pageId: pageResult.id };
+
+  const continuationRunId = 'run-review-continue-approval';
+  vi.spyOn(BuiltInAgent.prototype, 'run').mockReturnValue(
+    new Observable((sub) => {
+      sub.next({ type: EventType.RUN_STARTED, threadId: thread.id, runId: continuationRunId } as any);
+      sub.next({
+        type: EventType.TEXT_MESSAGE_START,
+        messageId: 'asst-msg-created-1',
+        role: 'assistant',
+      } as any);
+      sub.next({
+        type: EventType.TEXT_MESSAGE_CONTENT,
+        messageId: 'asst-msg-created-1',
+        delta: `Created page ${pageResult.id}.`,
+      } as any);
+      sub.next({ type: EventType.TEXT_MESSAGE_END, messageId: 'asst-msg-created-1' } as any);
+      sub.next({ type: EventType.RUN_FINISHED, threadId: thread.id, runId: continuationRunId, outcome: { type: 'success' } } as any);
+      sub.complete();
+    }),
+  );
+
+  await lastValueFrom(
+    agent
+      .run({
+        runId: continuationRunId,
+        threadId: thread.id,
+        messages: [
+          { id: 'user-1', role: 'user', content: 'Create a new project roadmap page' },
+          { id: 'asst-msg-review-1', role: 'assistant', content: '', toolCalls: reviewMsg?.toolCalls },
+          {
+            id: 'tool-result-approval-1',
+            role: 'tool',
+            toolCallId,
+            content: JSON.stringify(approvalPayload),
+          },
+        ] as any,
+        tools: [{ name: 'review_space_page', description: 'Review page', parameters: {} }] as any,
+        context: [],
+        state: {},
+        forwardedProps: {},
+      })
+      .pipe(toArray()),
+  );
+
+  // Durable execution record was atomically resolved to completed & approved
+  const resolvedExec = workspace.getToolExecution(reviewExec!.id);
+  expect(resolvedExec?.status).toBe('completed');
+  expect(resolvedExec?.approved).toBe(true);
+  expect(resolvedExec?.result).toEqual(approvalPayload);
+  expect(resolvedExec?.finishedAt).toBeGreaterThan(0);
 
   // Reconnect after approval: interrupt is no longer emitted
   const reconnectedAfterApproval = await lastValueFrom(
@@ -842,6 +885,154 @@ it('tracks frontend review tool approvals without interrupt outcome and restores
     (e: any) => e.type === EventType.RUN_FINISHED && e.outcome?.type === 'interrupt',
   );
   expect(postApprovalInterrupt).toBeUndefined();
+});
+
+it('tracks frontend review tool decline and resolves durable execution without duplicate interrupt on reconnect', async () => {
+  const dbPath = createTestDbPath();
+  const store = new Store(':memory:');
+  const workspace = new WorkspaceStore(dbPath, 'owner-1');
+  resources.push(() => {
+    store.close();
+    workspace.close();
+  });
+
+  const dot = workspace.dots()[0];
+  const space = workspace.spaces()[0];
+  const thread = workspace.bindThread('thread-review-decline', dot.id, 'Decline Review Thread');
+  workspace.saveMessage(thread.id, 'user', 'Create a scratch page');
+
+  const config: PlatformConfig = {
+    baseUrl: 'http://127.0.0.1:11434/v1',
+    nativeMode: true,
+    voiceName: 'marin',
+    slackUsers: [],
+    model: 'default-model',
+    runtimeUrl: 'http://localhost/api/copilotkit',
+  };
+
+  const agent = new DotAgent(store, workspace, config, dot.id);
+  const runId = 'run-decline-test-1';
+  const toolCallId = 'tc-review-decline-1';
+  const draftArgs = {
+    title: 'Scratchpad',
+    content: 'Draft content',
+    spaceId: space.id,
+  };
+
+  const reviewEvents = [
+    { type: EventType.RUN_STARTED, threadId: thread.id, runId },
+    {
+      type: EventType.TOOL_CALL_START,
+      toolCallId,
+      toolCallName: 'review_space_page',
+      parentMessageId: 'asst-msg-decline-draft',
+    },
+    {
+      type: EventType.TOOL_CALL_ARGS,
+      toolCallId,
+      delta: JSON.stringify(draftArgs),
+    },
+    { type: EventType.TOOL_CALL_END, toolCallId },
+    { type: EventType.RUN_FINISHED, threadId: thread.id, runId, outcome: { type: 'success' } },
+  ];
+
+  vi.spyOn(BuiltInAgent.prototype, 'run').mockReturnValue(
+    new Observable((sub) => {
+      for (const ev of reviewEvents) sub.next(ev as any);
+      sub.complete();
+    }),
+  );
+
+  await lastValueFrom(
+    agent
+      .run({
+        runId,
+        threadId: thread.id,
+        messages: [{ id: 'user-decline-1', role: 'user', content: 'Create a scratch page' }] as any,
+        tools: [{ name: 'review_space_page', description: 'Review page', parameters: {} }] as any,
+        context: [],
+        state: {},
+        forwardedProps: {},
+      })
+      .pipe(toArray()),
+  );
+
+  const reviewExec = workspace.getToolExecutions(thread.id).find((e) => e.toolCallId === toolCallId);
+  expect(reviewExec).toBeDefined();
+  expect(reviewExec?.status).toBe('awaiting_approval');
+  expect(reviewExec?.approved).toBe(false);
+
+  // Fresh runner connect reproduces interrupt before user response
+  const runner = new NativeAgentRunner({ workspace });
+  const initialReconnect = await lastValueFrom(
+    runner.connect({ threadId: thread.id }).pipe(toArray()),
+  );
+  const initialInterrupt = initialReconnect.find(
+    (e: any) => e.type === EventType.RUN_FINISHED && e.outcome?.type === 'interrupt',
+  );
+  expect(initialInterrupt).toBeDefined();
+
+  // User declines approval - sent into continuation run without manually editing DB
+  const continuationRunId = 'run-decline-continuation-1';
+  const declinePayload = { declined: true };
+
+  vi.spyOn(BuiltInAgent.prototype, 'run').mockReturnValue(
+    new Observable((sub) => {
+      sub.next({ type: EventType.RUN_STARTED, threadId: thread.id, runId: continuationRunId } as any);
+      sub.next({
+        type: EventType.TEXT_MESSAGE_START,
+        messageId: 'asst-msg-cancelled',
+        role: 'assistant',
+      } as any);
+      sub.next({
+        type: EventType.TEXT_MESSAGE_CONTENT,
+        messageId: 'asst-msg-cancelled',
+        delta: 'Page creation was cancelled.',
+      } as any);
+      sub.next({ type: EventType.TEXT_MESSAGE_END, messageId: 'asst-msg-cancelled' } as any);
+      sub.next({ type: EventType.RUN_FINISHED, threadId: thread.id, runId: continuationRunId, outcome: { type: 'success' } } as any);
+      sub.complete();
+    }),
+  );
+
+  await lastValueFrom(
+    agent
+      .run({
+        runId: continuationRunId,
+        threadId: thread.id,
+        messages: [
+          { id: 'user-decline-1', role: 'user', content: 'Create a scratch page' },
+          { id: 'asst-msg-decline-draft', role: 'assistant', content: '', toolCalls: [{ id: toolCallId, type: 'function', function: { name: 'review_space_page', arguments: JSON.stringify(draftArgs) } }] },
+          {
+            id: 'tool-result-decline-1',
+            role: 'tool',
+            toolCallId,
+            content: JSON.stringify(declinePayload),
+          },
+        ] as any,
+        tools: [{ name: 'review_space_page', description: 'Review page', parameters: {} }] as any,
+        context: [],
+        state: {},
+        forwardedProps: {},
+      })
+      .pipe(toArray()),
+  );
+
+  // Durable execution record was atomically resolved to rejected
+  const resolvedExec = workspace.getToolExecution(reviewExec!.id);
+  expect(resolvedExec?.status).toBe('rejected');
+  expect(resolvedExec?.approved).toBe(false);
+  expect(resolvedExec?.result).toEqual(declinePayload);
+  expect(resolvedExec?.finishedAt).toBeGreaterThan(0);
+
+  // Reconnect after decline: no interrupt is emitted
+  const reconnectedAfterDecline = await lastValueFrom(
+    runner.connect({ threadId: thread.id }).pipe(toArray()),
+  );
+  const postDeclineInterrupt = reconnectedAfterDecline.find(
+    (e: any) => e.type === EventType.RUN_FINISHED && e.outcome?.type === 'interrupt',
+  );
+  expect(postDeclineInterrupt).toBeUndefined();
 });
 
 it('verifies native turn and specialist delegation record run status as completed, not cancelled', async () => {

@@ -319,6 +319,8 @@ export class Platform {
         return Response.json({ messages, nextCursor: null });
       }
       if (method === 'POST') {
+        const toolCallId =
+          resourceBody?.toolCallId || resourceBody?.tool_call_id;
         const msg = this.workspace.saveMessage(
           threadId,
           resourceBody?.role || 'user',
@@ -326,10 +328,33 @@ export class Platform {
           {
             id: resourceBody?.id,
             toolCalls: resourceBody?.toolCalls,
-            toolCallId: resourceBody?.toolCallId,
+            toolCallId,
             metadata: resourceBody?.metadata,
           },
         );
+        if (resourceBody?.role === 'tool' && toolCallId) {
+          let parsedResult: any = resourceBody?.content;
+          if (typeof resourceBody?.content === 'string') {
+            try {
+              parsedResult = JSON.parse(resourceBody?.content);
+            } catch {
+              parsedResult = resourceBody?.content;
+            }
+          }
+          const isDeclined =
+            parsedResult && typeof parsedResult === 'object'
+              ? parsedResult.approved === false ||
+                parsedResult.declined === true ||
+                parsedResult.rejected === true
+              : false;
+
+          this.workspace.resolveToolExecution(threadId, toolCallId, {
+            result: parsedResult,
+            approved: !isDeclined,
+            status: !isDeclined ? 'completed' : 'rejected',
+            finishedAt: Date.now(),
+          });
+        }
         return Response.json(msg);
       }
     }
