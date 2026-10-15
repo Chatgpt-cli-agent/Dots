@@ -60,6 +60,7 @@ const config: PlatformConfig = {
   slackDotId: process.env.SLACK_DOT_ID || undefined,
   runtimeUrl: `http://${host === '::1' ? '[::1]' : '127.0.0.1'}:${port}/api/copilotkit`,
   ownerToken,
+  nativeMode: process.env.NATIVE_MODE === 'false' ? false : true,
 };
 const platform = new Platform(store, workspace, config);
 const researchConfig = {

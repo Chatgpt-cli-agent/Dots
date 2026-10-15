@@ -92,6 +92,11 @@ export interface Dot {
   createdAt: number;
   learningContainerId?: string | null;
   skillDeliveryEnabled?: boolean;
+  modelEndpoint?: string;
+  modelId?: string;
+  contextLimit?: number;
+  maxCompletionTokens?: number;
+  apiKey?: string;
 }
 export interface Conversation {
   id: string;
@@ -99,8 +104,55 @@ export interface Conversation {
   ownerId: string;
   title: string;
   createdAt: number;
+  updatedAt?: number;
+  archivedAt?: number | null;
+  metadata?: Record<string, unknown> | null;
   /** Frozen at creation; null means this conversation does not participate. */
   learningContainerId?: string | null;
+}
+export interface NativeMessage {
+  id: string;
+  threadId: string;
+  role: 'user' | 'assistant' | 'system' | 'tool';
+  content: string;
+  createdAt: number;
+  runId?: string | null;
+  toolCalls?: Array<{ id: string; name: string; args: unknown }>;
+  toolCallId?: string | null;
+  status?: 'pending' | 'success' | 'failed' | 'cancelled';
+  metadata?: Record<string, unknown> | null;
+}
+export interface NativeRun {
+  id: string;
+  threadId: string;
+  dotId: string;
+  parentRunId?: string | null;
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  error?: string | null;
+  startedAt: number;
+  finishedAt?: number | null;
+  metadata?: Record<string, unknown> | null;
+}
+export interface NativeToolExecution {
+  id: string;
+  runId: string;
+  threadId: string;
+  toolCallId?: string | null;
+  toolName: string;
+  args: Record<string, unknown>;
+  result?: unknown;
+  status:
+    | 'pending'
+    | 'awaiting_approval'
+    | 'approved'
+    | 'rejected'
+    | 'completed'
+    | 'failed';
+  approvalRequired: boolean;
+  approved: boolean;
+  error?: string | null;
+  createdAt: number;
+  finishedAt?: number | null;
 }
 export interface CallReceipt {
   anchorMessageId?: string | null;

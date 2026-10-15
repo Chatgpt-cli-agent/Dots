@@ -6,6 +6,7 @@ import { z } from 'zod';
 import {
   computerInputs,
   computerPermissionsSchema,
+  hostComputerInputs,
   type ComputerAction,
   type ComputerControl,
   type ComputerStatus,
@@ -34,10 +35,22 @@ export class ComputerService {
     private transport: typeof fetch = fetch,
     private deadlineMs = 70000,
   ) {}
-  get configured() {
+  get hasSupervisor(): boolean {
+    return !!(
+      this.config.computerSupervisorUrl?.trim() &&
+      this.config.computerSupervisorToken?.trim() &&
+      this.config.computerToken?.trim()
+    );
+  }
+  get configured(): boolean {
     return true;
   }
   private token(id: string) {
+    if (this.config.computerToken?.trim()) {
+      return createHmac('sha256', this.config.computerToken.trim())
+        .update(`opendots-computer:${id}`)
+        .digest('hex');
+    }
     return 'local-computer-token';
   }
   private requireDot(id: string) {
@@ -50,6 +63,10 @@ export class ComputerService {
     actor: 'agent' | 'owner',
   ) {
     this.requireDot(id);
+    const policy = this.workspace.computers.permissions(id);
+    if (!policy.enabled || (kind && !policy[kind])) {
+      throw new Error('Computer permission is disabled.');
+    }
     if (actor === 'agent' && this.paused())
       throw new Error('Agents are paused.');
   }
@@ -189,10 +206,46 @@ export class ComputerService {
   }
   async status(id: string): Promise<ComputerStatus> {
     this.requireDot(id);
+    const policy = this.workspace.computers.permissions(id);
+    if (this.hasSupervisor) {
+      const base = {
+        configured: true,
+        permissions: policy,
+        audit: this.workspace.computers.audit(id),
+      };
+      try {
+        const state = await this.existing(id);
+        if (!state || state.status !== 'running')
+          return { ...base, state: 'stopped' };
+        const url = this.endpoint(id, state);
+        const control = controlSchema.parse(
+          await this.json(
+            `${url}/control`,
+            this.token(id),
+            undefined,
+            undefined,
+            id,
+          ),
+        );
+        return { ...base, state: 'running', control };
+      } catch {
+        return {
+          ...base,
+          state: 'unavailable',
+          error:
+            'Computer service is unavailable. Check the supervisor configuration and connection.',
+        };
+      }
+    }
     return {
       configured: true,
       state: 'running',
-      permissions: { enabled: true, browser: false, files: true, shell: true },
+      permissions: {
+        enabled: policy.enabled,
+        browser: false,
+        files: policy.files,
+        shell: policy.shell,
+      },
       audit: this.workspace.computers.audit(id),
     };
   }
@@ -222,6 +275,9 @@ export class ComputerService {
   }
   async start(id: string) {
     await this.audited(id, 'start', 'owner', async () => {
+      if (!this.hasSupervisor) {
+        throw new Error('Computer service is not configured.');
+      }
       this.allowed(id, undefined, 'owner');
       this.endpoint(id, await this.supervisor(`/computers/${id}/ensure`, {}));
     });
@@ -229,16 +285,20 @@ export class ComputerService {
   }
   async stop(id: string) {
     await this.audited(id, 'stop', 'owner', async () => {
-      if (!this.configured)
+      if (!this.hasSupervisor) {
         throw new Error('Computer service is not configured.');
+      }
       await this.supervisor(`/computers/${id}/stop`, {});
     });
     return this.status(id);
   }
   async control(id: string, verb: 'take' | 'release') {
     await this.audited(id, verb, 'owner', async () => {
-      if (!this.configured)
-        throw new Error('Computer service is not configured.');
+      if (!this.hasSupervisor) {
+        throw new Error(
+          'Interactive browser control is only supported with container supervisor.',
+        );
+      }
       if (verb === 'take') this.allowed(id, 'browser', 'owner');
       const url = await this.running(id);
       if (verb === 'take') this.allowed(id, 'browser', 'owner');
@@ -297,14 +357,63 @@ export class ComputerService {
     actor: 'owner' | 'agent' = 'owner',
     signal?: AbortSignal,
   ): Promise<unknown> {
-    if (!Object.hasOwn(computerInputs, action))
+    const isHostAction =
+      !this.hasSupervisor && Object.hasOwn(hostComputerInputs, action);
+    if (!Object.hasOwn(computerInputs, action) && !isHostAction)
       throw new Error('Unknown computer action.');
-    const parsed = computerInputs[action].parse(input);
+    const parsed = isHostAction
+      ? hostComputerInputs[action as keyof typeof hostComputerInputs].parse(input)
+      : computerInputs[action].parse(input);
     return this.audited(id, action, actor, async () => {
       if (actor === 'agent' && action.startsWith('human_'))
         throw new Error('Human controls are owner-only.');
-      this.allowed(id, undefined, actor);
+      const kind =
+        action === 'exec'
+          ? 'shell'
+          : action.startsWith('files_')
+            ? 'files'
+            : 'browser';
+      this.allowed(id, kind, actor);
 
+      if (this.hasSupervisor) {
+        const cancellation = new AbortController();
+        const activeSignal = signal
+          ? AbortSignal.any([signal, cancellation.signal])
+          : cancellation.signal;
+        const watcher = setInterval(() => {
+          try {
+            this.allowed(id, kind, actor);
+          } catch {
+            cancellation.abort();
+          }
+        }, 50);
+        try {
+          const url = await this.running(id, activeSignal);
+          this.allowed(id, kind, actor);
+          activeSignal.throwIfAborted();
+          const path = action
+            .replace(/^files_/, 'files/')
+            .replace(/^human_/, 'human/');
+          const result = await this.json(
+            `${url}/${path}`,
+            this.token(id),
+            ['read', 'screenshot'].includes(action) ? undefined : parsed,
+            activeSignal,
+            id,
+          );
+          this.allowed(id, kind, actor);
+          if (action === 'exec' && result && typeof result === 'object') {
+            const copy = { ...result } as Record<string, unknown>;
+            delete copy.command;
+            return copy;
+          }
+          return result;
+        } finally {
+          clearInterval(watcher);
+        }
+      }
+
+      // Host execution mode (unrestricted host drives, async cancellable exec)
       if (action === 'files_list') {
         const targetPath = (parsed as { path?: string }).path || process.cwd();
         try {
@@ -351,29 +460,99 @@ export class ComputerService {
       }
 
       if (action === 'exec') {
-        try {
-          const { command, timeoutMs } = parsed as {
-            command: string;
-            timeoutMs?: number;
+        const { command, timeoutMs } = parsed as {
+          command: string;
+          timeoutMs?: number;
+        };
+        const maxTime = timeoutMs || 120000;
+        return new Promise((resolve) => {
+          let stdout = '';
+          let stderr = '';
+          let completed = false;
+
+          const child = child_process.spawn(
+            'powershell.exe',
+            ['-NoProfile', '-Command', command],
+            {
+              shell: false,
+              windowsHide: true,
+            },
+          );
+
+          const timer = setTimeout(() => {
+            if (!completed) {
+              completed = true;
+              child.kill();
+              resolve({
+                stdout,
+                stderr:
+                  stderr + '\nExecution timed out after ' + maxTime + 'ms',
+                exitCode: 124,
+              });
+            }
+          }, maxTime);
+
+          const abortHandler = () => {
+            if (!completed) {
+              completed = true;
+              clearTimeout(timer);
+              child.kill();
+              resolve({
+                stdout,
+                stderr: stderr + '\nExecution cancelled by signal',
+                exitCode: 130,
+              });
+            }
           };
-          const stdout = child_process.execSync(command, {
-            timeout: timeoutMs || 120000,
-            shell: 'powershell.exe',
-            encoding: 'utf-8',
-            maxBuffer: 50 * 1024 * 1024,
+
+          if (signal) {
+            if (signal.aborted) {
+              abortHandler();
+              return;
+            }
+            signal.addEventListener('abort', abortHandler, { once: true });
+          }
+
+          child.stdout?.on('data', (data) => {
+            if (stdout.length < 50 * 1024 * 1024)
+              stdout += data.toString('utf-8');
           });
-          return { stdout, exitCode: 0 };
-        } catch (err: any) {
-          return {
-            stdout: err.stdout ? String(err.stdout) : '',
-            stderr: err.stderr ? String(err.stderr) : err.message,
-            exitCode: err.status || 1,
-          };
-        }
+
+          child.stderr?.on('data', (data) => {
+            if (stderr.length < 10 * 1024 * 1024)
+              stderr += data.toString('utf-8');
+          });
+
+          child.on('close', (code) => {
+            if (!completed) {
+              completed = true;
+              clearTimeout(timer);
+              if (signal) signal.removeEventListener('abort', abortHandler);
+              resolve({
+                stdout,
+                stderr,
+                exitCode: code ?? 0,
+              });
+            }
+          });
+
+          child.on('error', (err) => {
+            if (!completed) {
+              completed = true;
+              clearTimeout(timer);
+              if (signal) signal.removeEventListener('abort', abortHandler);
+              resolve({
+                stdout,
+                stderr: stderr ? `${stderr}\n${err.message}` : err.message,
+                exitCode: 1,
+              });
+            }
+          });
+        });
       }
 
       return {
-        error: `Action ${action} is not supported in local desktop mode.`,
+        error: `Action ${action} is not supported in local host mode.`,
       };
     });
   }

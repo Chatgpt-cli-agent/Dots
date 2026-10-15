@@ -3,7 +3,23 @@ import * as path from 'node:path';
 import { defineTool } from '@copilotkit/runtime/v2';
 import { z } from 'zod';
 
-export const SKILLS_ROOT = 'C:\\Users\\jmoor\\Projects\\GalaxyOne\\skills';
+export function getSkillsRoot(): string {
+  if (process.env.GALAXYONE_SKILLS_PATH)
+    return process.env.GALAXYONE_SKILLS_PATH;
+  if (process.env.SKILLS_PATH) return process.env.SKILLS_PATH;
+  if (process.env.SKILLS_DIR) return process.env.SKILLS_DIR;
+  const standardPaths = [
+    'C:\\Users\\jmoor\\Projects\\GalaxyOne\\skills',
+    path.resolve(process.cwd(), '../GalaxyOne/skills'),
+    path.resolve(process.cwd(), 'skills'),
+  ];
+  for (const p of standardPaths) {
+    if (fs.existsSync(p)) return p;
+  }
+  return standardPaths[0];
+}
+
+export const SKILLS_ROOT = getSkillsRoot();
 
 export interface SkillInfo {
   name: string;
@@ -15,12 +31,13 @@ let cachedSkills: SkillInfo[] | null = null;
 export function getAvailableSkills(): SkillInfo[] {
   if (cachedSkills) return cachedSkills;
   try {
-    if (!fs.existsSync(SKILLS_ROOT)) return [];
-    const entries = fs.readdirSync(SKILLS_ROOT, { withFileTypes: true });
+    const root = getSkillsRoot();
+    if (!fs.existsSync(root)) return [];
+    const entries = fs.readdirSync(root, { withFileTypes: true });
     const skills: SkillInfo[] = [];
     for (const entry of entries) {
       if (entry.isDirectory() && !entry.name.startsWith('.')) {
-        const skillMd = path.join(SKILLS_ROOT, entry.name, 'SKILL.md');
+        const skillMd = path.join(root, entry.name, 'SKILL.md');
         let description = '';
         if (fs.existsSync(skillMd)) {
           const content = fs.readFileSync(skillMd, 'utf-8');
@@ -37,11 +54,16 @@ export function getAvailableSkills(): SkillInfo[] {
   }
 }
 
-export function readSkillContent(skillName: string, relativePath = 'SKILL.md'): string {
+export function readSkillContent(
+  skillName: string,
+  relativePath = 'SKILL.md',
+): string {
   try {
     const cleanName = path.basename(skillName);
-    const targetFile = relativePath ? relativePath.replace(/^(\/|\\)+/, '') : 'SKILL.md';
-    const fullPath = path.join(SKILLS_ROOT, cleanName, targetFile);
+    const targetFile = relativePath
+      ? relativePath.replace(/^(\/|\\)+/, '')
+      : 'SKILL.md';
+    const fullPath = path.join(getSkillsRoot(), cleanName, targetFile);
     if (!fs.existsSync(fullPath)) {
       return `Skill file not found: ${cleanName}/${targetFile}`;
     }

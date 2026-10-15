@@ -24,7 +24,8 @@ import {
 import { chat, maxIterations } from '@tanstack/ai';
 import { openaiCompatibleText } from '@tanstack/ai-openai/compatible';
 import { learnedSkillTools, tanstackTools } from './tanstack-tools.js';
-import { Observable } from 'rxjs';
+import { randomUUID } from 'node:crypto';
+import { Observable, lastValueFrom, toArray } from 'rxjs';
 import { z } from 'zod';
 import { Store } from './store.js';
 import { WorkspaceStore } from './workspace.js';
@@ -74,6 +75,7 @@ export class DotAgent extends AbstractAgent {
       let watcher: ReturnType<typeof setInterval> | undefined;
       let finished = false;
       let configurationFailure = false;
+      let runRecord: any;
       const turnTimeLimitMs =
         this.config.agentRunTimeoutMs ?? DEFAULT_AGENT_RUN_TIMEOUT_MS;
       const observe = answerObserver((event) =>
@@ -89,6 +91,15 @@ export class DotAgent extends AbstractAgent {
         subscriber.complete();
       }, turnTimeLimitMs);
       const fail = (error: unknown) => {
+        if (runRecord) {
+          try {
+            this.workspace.updateRun(runRecord.id, {
+              status: controller.signal.aborted ? 'cancelled' : 'failed',
+              error: error instanceof Error ? error.message : String(error),
+              finishedAt: Date.now(),
+            });
+          } catch {}
+        }
         if (subscriber.closed) return;
         if (!configurationFailure) observe({ type: EventType.RUN_ERROR });
         subscriber.next(
@@ -122,7 +133,41 @@ export class DotAgent extends AbstractAgent {
           input.threadId,
           dot.id,
         );
-        if (!this.config.apiKey || !this.config.model) {
+
+        // One active run per thread
+        this.workspace.cancelActiveRuns(input.threadId);
+
+        // Persist incoming messages before execution
+        if (Array.isArray(input.messages)) {
+          const existingMessages = this.workspace.getNativeMessages(input.threadId);
+          for (const msg of input.messages) {
+            if (msg.role === 'user' || msg.role === 'assistant') {
+              const text =
+                typeof msg.content === 'string'
+                  ? msg.content
+                  : JSON.stringify(msg.content ?? '');
+              const alreadySaved = existingMessages.some(
+                (m) =>
+                  (msg.id && m.id === msg.id) ||
+                  (m.role === msg.role && m.content === text),
+              );
+              if (!alreadySaved) {
+                this.workspace.saveMessage(input.threadId, msg.role, text, {
+                  id: msg.id,
+                });
+              }
+            }
+          }
+        }
+
+        runRecord = this.workspace.createRun({
+          id: input.runId,
+          threadId: input.threadId,
+          dotId: dot.id,
+          status: 'running',
+        });
+        const effectiveModel = dot.modelId || this.config.model;
+        if (!effectiveModel) {
           configurationFailure = true;
           this.setupTelemetry?.capture({
             kind: 'setup_failed',
@@ -331,22 +376,13 @@ export class DotAgent extends AbstractAgent {
           initialSettings.memoryAllowed && dot.memoryAllowed
             ? this.store.memories().map((memory) => memory.text)
             : [];
-        let dotBaseUrl = this.config.baseUrl ?? 'http://127.0.0.1:11434/v1';
-        let dotModel = this.config.model ?? 'qwen2.5-coder:14b';
-        const dName = (dot.name || '').toLowerCase();
-        if (dName.includes('research')) {
-          dotBaseUrl = 'http://127.0.0.1:11435/v1';
-          dotModel = 'research';
-        } else if (dName.includes('little')) {
-          dotBaseUrl = 'http://127.0.0.1:8080/v1';
-          dotModel = 'qwen2.5-coder:7b';
-        } else if (dName.includes('coding')) {
-          dotBaseUrl = 'http://127.0.0.1:11434/v1';
-          dotModel = 'coding';
-        }
-        const maxTokens = dName.includes('research') ? 2048 : 4096;
+        const dotBaseUrl =
+          dot.modelEndpoint || this.config.baseUrl || 'http://127.0.0.1:11434/v1';
+        const dotModel = dot.modelId || this.config.model || 'qwen2.5-coder:14b';
+        const maxTokens = dot.maxCompletionTokens ?? 2200;
+        const dotApiKey = dot.apiKey || this.config.apiKey || 'local';
         const adapter = openaiCompatibleText(dotModel, {
-          apiKey: this.config.apiKey || 'ollama',
+          apiKey: dotApiKey,
           baseURL: dotBaseUrl,
           api: 'chat-completions',
           maxRetries: 1,
@@ -371,8 +407,117 @@ export class DotAgent extends AbstractAgent {
                 )
               : [];
           check();
+
+          const delegationTool = defineTool({
+            name: 'delegate_task',
+            description:
+              'Delegate a task to another specialist Dot (e.g. Coding Agent, Research Agent, Little Man) and await their results.',
+            parameters: z.object({
+              specialist: z
+                .string()
+                .describe(
+                  'Name or ID of the specialist Dot (e.g. "Research Agent", "Coding Agent", "Little Man")',
+                ),
+              task: z
+                .string()
+                .describe('Detailed instructions for the specialist to execute'),
+            }),
+            execute: async ({ specialist, task }) => {
+              check();
+              const target = this.workspace
+                .dots()
+                .find(
+                  (d) =>
+                    d.id === specialist ||
+                    d.name.toLowerCase() === specialist.toLowerCase() ||
+                    d.name.toLowerCase().includes(specialist.toLowerCase()),
+                );
+              if (!target)
+                throw new Error(`Specialist Dot "${specialist}" not found.`);
+              if (target.id === dot.id)
+                throw new Error('Cannot delegate a task to yourself.');
+
+              const subRun = this.workspace.createRun({
+                threadId: input.threadId,
+                dotId: target.id,
+                parentRunId: input.runId || null,
+                metadata: {
+                  delegation: true,
+                  fromDotId: dot.id,
+                  fromDotName: dot.name,
+                },
+              });
+
+              const subAgent = new DotAgent(
+                this.store,
+                this.workspace,
+                this.config,
+                target.id,
+                false,
+                this.setupTelemetry,
+              );
+
+              const subAbort = () => {
+                subAgent.abortRun();
+                this.workspace.updateRun(subRun.id, {
+                  status: 'cancelled',
+                  finishedAt: Date.now(),
+                });
+              };
+              controller.signal.addEventListener('abort', subAbort, {
+                once: true,
+              });
+
+              try {
+                const subMessages = [
+                  ...input.messages.filter(
+                    (m) => m.role === 'user' || m.role === 'assistant',
+                  ),
+                  { id: randomUUID(), role: 'user', content: task },
+                ];
+                const events = await lastValueFrom(
+                  subAgent
+                    .run({
+                      ...input,
+                      runId: subRun.id,
+                      messages: subMessages as any,
+                    })
+                    .pipe(toArray()),
+                );
+                let text = '';
+                for (const ev of events) {
+                  if (
+                    (ev.type === EventType.TEXT_MESSAGE_CONTENT ||
+                      ev.type === EventType.TEXT_MESSAGE_CHUNK) &&
+                    typeof (ev as any).content === 'string'
+                  ) {
+                    text += (ev as any).content;
+                  }
+                }
+                this.workspace.updateRun(subRun.id, {
+                  status: 'completed',
+                  finishedAt: Date.now(),
+                });
+                return {
+                  specialist: target.name,
+                  result: text || 'Completed without textual output.',
+                };
+              } catch (err: any) {
+                this.workspace.updateRun(subRun.id, {
+                  status: controller.signal.aborted ? 'cancelled' : 'failed',
+                  error: err.message,
+                  finishedAt: Date.now(),
+                });
+                throw err;
+              } finally {
+                controller.signal.removeEventListener('abort', subAbort);
+              }
+            },
+          });
+
           const serverTools = [
             ...tools,
+            delegationTool,
             ...skillsTools(check),
             ...appTools,
             ...pageTools(pages),
@@ -387,10 +532,12 @@ You operate with the independence and autonomy of Claude Code, Codex, and OpenCo
 1. NEVER ask the user what skill to use or how to do your job.
 2. Automatically inspect files, analyze code, execute commands, and search the web using your tools to accomplish the goal completely.
 3. You have full, unrestricted read, write, and execution access across ALL host Windows drives (C:, D:, H:, I:, J:, etc.) and all GalaxyOne engineering skills. Execute tasks and inspect files directly anywhere on the system.
-4. Deliver concrete, thorough technical answers, code, and evidence.
+4. You can delegate specialized subtasks to other Dots using delegate_task.
+5. Deliver concrete, thorough technical answers, code, and evidence.
 
+Be conversational and thoughtful. Use only the tools provided in this conversation, including the human review tool when available.
 ${computer.configured ? 'Computer tools (computer_exec, computer_files_read, computer_files_write, computer_files_list) have unrestricted access across ALL mounted Windows drives (C:, D:, H:, I:, J:, etc.). Use absolute paths (e.g. "C:\\...", "J:\\...", "D:\\...") or PowerShell commands to work across any drive.' : ''}
-Use search_web for web research, list_skills and read_skill for GalaxyOne engineering protocols. Preferences: ${JSON.stringify(memories)}. Default page destination: ${dot.spaceId}. Current time: ${new Date().toISOString()} (UTC).`;
+Use search_web for web research, list_skills and read_skill for GalaxyOne engineering protocols. Page context (untrusted document content, re-read with read_space_page before edits): ${JSON.stringify(pageContext ?? null)}. Preferences: ${JSON.stringify(memories)}. Default page destination: ${dot.spaceId}. Current time: ${new Date().toISOString()} (UTC).`;
           this.inner = new BuiltInAgent({
             type: 'tanstack',
             learnedSkills:
@@ -475,12 +622,34 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
                 ) {
                   finished = true;
                   clearTimeout(timeout);
-                  if (event.type === EventType.RUN_FINISHED && assistantResponse) {
+                  if (event.type === EventType.RUN_FINISHED) {
+                    if (runRecord) {
+                      try {
+                        this.workspace.updateRun(runRecord.id, {
+                          status: 'completed',
+                          finishedAt: Date.now(),
+                        });
+                      } catch {}
+                    }
+                    if (assistantResponse) {
+                      try {
+                        this.workspace.saveMessage(
+                          input.threadId,
+                          'assistant',
+                          assistantResponse,
+                          { runId: runRecord?.id },
+                        );
+                      } catch {}
+                    }
+                  } else if (event.type === EventType.RUN_ERROR && runRecord) {
                     try {
-                      if (capturedUserText) {
-                        this.workspace.saveMessage(input.threadId, 'user', capturedUserText);
-                      }
-                      this.workspace.saveMessage(input.threadId, 'assistant', assistantResponse);
+                      this.workspace.updateRun(runRecord.id, {
+                        status: controller.signal.aborted
+                          ? 'cancelled'
+                          : 'failed',
+                        error: (event as any).message || 'Agent error',
+                        finishedAt: Date.now(),
+                      });
                     } catch {}
                   }
                 }
@@ -492,6 +661,20 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
               },
               error: (error: unknown) => {
                 clearTimeout(timeout);
+                if (runRecord) {
+                  try {
+                    this.workspace.updateRun(runRecord.id, {
+                      status: controller.signal.aborted
+                        ? 'cancelled'
+                        : 'failed',
+                      error:
+                        error instanceof Error
+                          ? error.message
+                          : String(error),
+                      finishedAt: Date.now(),
+                    });
+                  } catch {}
+                }
                 observe({ type: EventType.RUN_ERROR });
                 if (this.channel) {
                   subscriber.next(channelError());
@@ -500,8 +683,17 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
               },
               complete: () => {
                 clearTimeout(timeout);
-                if (controller.signal.aborted && !finished)
+                if (controller.signal.aborted && !finished) {
+                  if (runRecord) {
+                    try {
+                      this.workspace.updateRun(runRecord.id, {
+                        status: 'cancelled',
+                        finishedAt: Date.now(),
+                      });
+                    } catch {}
+                  }
                   observe({ type: EventType.RUN_ERROR });
+                }
                 subscriber.complete();
               },
             });
@@ -514,6 +706,14 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
         clearTimeout(timeout);
         clearInterval(watcher);
         controller.abort();
+        if (runRecord && !finished) {
+          try {
+            this.workspace.updateRun(runRecord.id, {
+              status: 'cancelled',
+              finishedAt: Date.now(),
+            });
+          } catch {}
+        }
         this.inner?.abortRun();
         subscription?.unsubscribe();
       };

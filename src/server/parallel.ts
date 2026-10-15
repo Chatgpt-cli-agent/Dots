@@ -3,17 +3,28 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { z } from 'zod';
 
-export type WebSearchProvider = 'parallel' | 'browser' | 'disabled';
+export type WebSearchProvider =
+  | 'parallel'
+  | 'browser'
+  | 'searxng'
+  | 'local'
+  | 'disabled';
 export interface WebConfig {
   webSearchProvider?: WebSearchProvider;
   parallelApiKey?: string;
 }
 export function webSearchProvider(value?: string): WebSearchProvider {
   if (!value) return 'parallel';
-  if (value === 'parallel' || value === 'browser' || value === 'disabled')
+  if (
+    value === 'parallel' ||
+    value === 'browser' ||
+    value === 'searxng' ||
+    value === 'local' ||
+    value === 'disabled'
+  )
     return value;
   throw new Error(
-    'WEB_SEARCH_PROVIDER must be parallel, browser, or disabled.',
+    'WEB_SEARCH_PROVIDER must be parallel, browser, searxng, local, or disabled.',
   );
 }
 const source = z.object({
@@ -108,7 +119,7 @@ export function sourcesFromResult(
     );
   return sources;
 }
-export async function parallelSources(
+export async function localWebSources(
   request: {
     objective: string;
     urls?: string[];
@@ -116,22 +127,22 @@ export async function parallelSources(
     searchQueries?: string[];
     onWarning?: (message: string) => void;
   },
-  config: WebConfig,
   signal: AbortSignal,
 ): Promise<WebSource[]> {
   signal.throwIfAborted();
-  if (config.webSearchProvider === 'disabled')
-    throw new Error('Web research is disabled.');
-
-  // If specific URLs are provided (read_public_page)
   if (request.urls && request.urls.length > 0) {
     const results: WebSource[] = [];
     for (const rawUrl of request.urls.slice(0, 5)) {
       try {
-        const fetchSignal = AbortSignal.any([signal, AbortSignal.timeout(12000)]);
+        const fetchSignal = AbortSignal.any([
+          signal,
+          AbortSignal.timeout(12000),
+        ]);
         const res = await fetch(rawUrl, {
           signal: fetchSignal,
-          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+          },
         });
         if (!res.ok) continue;
         const html = await res.text();
@@ -146,15 +157,14 @@ export async function parallelSources(
           url: rawUrl,
           text: text.slice(0, 6000),
         });
-      } catch {
-        // Skip failed URLs
-      }
+      } catch {}
     }
     if (results.length > 0) return results;
   }
 
-  // Web search queries (SearXNG on port 8888, with DuckDuckGo engine)
-  const queries = request.searchQueries?.length ? request.searchQueries : [request.objective];
+  const queries = request.searchQueries?.length
+    ? request.searchQueries
+    : [request.objective];
   const query = queries[0] || request.objective;
   const searxUrl = `http://127.0.0.1:8888/search?q=${encodeURIComponent(query)}&format=json`;
 
@@ -175,11 +185,8 @@ export async function parallelSources(
         }));
       }
     }
-  } catch {
-    // SearXNG error, fallback to DuckDuckGo
-  }
+  } catch {}
 
-  // Fallback: DuckDuckGo HTML
   try {
     const ddgUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
     const fetchSignal = AbortSignal.any([signal, AbortSignal.timeout(8000)]);
@@ -203,9 +210,117 @@ export async function parallelSources(
         },
       ];
     }
-  } catch {
-    // Silent
-  }
+  } catch {}
 
   return [];
+}
+
+export async function parallelSources(
+  request: {
+    objective: string;
+    urls?: string[];
+    sessionId?: string;
+    searchQueries?: string[];
+    onWarning?: (message: string) => void;
+  },
+  config: WebConfig,
+  signal: AbortSignal,
+): Promise<WebSource[]> {
+  signal.throwIfAborted();
+  if (config.webSearchProvider === 'disabled')
+    throw new Error('Web research is disabled.');
+
+  if (
+    config.webSearchProvider === 'searxng' ||
+    config.webSearchProvider === 'local'
+  ) {
+    return localWebSources(request, signal);
+  }
+
+  // MCP client for Parallel provider
+  const client = new Client({ name: 'opendots', version: '0.1.0' });
+  const boundedSignal = AbortSignal.any([signal, AbortSignal.timeout(60_000)]);
+  const transport = new StreamableHTTPClientTransport(
+    new URL('https://search.parallel.ai/mcp'),
+    {
+      requestInit: config.parallelApiKey
+        ? { headers: { Authorization: `Bearer ${config.parallelApiKey}` } }
+        : undefined,
+      fetch: (url, init) =>
+        fetch(url, {
+          ...init,
+          signal: AbortSignal.any([
+            boundedSignal,
+            ...(init?.signal ? [init.signal] : []),
+          ]),
+        }),
+    },
+  );
+  const session_id = request.sessionId ?? randomUUID();
+  const objective = request.objective;
+  const search_queries = request.searchQueries ?? [objective];
+  const warn = request.onWarning ?? (() => {});
+  try {
+    await client.connect(transport);
+    let urls = request.urls;
+    if (!urls?.length) {
+      const found = sourcesFromResult(
+        await client.callTool(
+          {
+            name: 'web_search',
+            arguments: { objective, search_queries, session_id },
+          },
+          undefined,
+          { signal: boundedSignal },
+        ),
+        warn,
+      );
+      urls = found.map((page) => page.url);
+      if (!urls.length)
+        throw new Error(
+          'Parallel found no usable sources. Try a more specific research request.',
+        );
+    }
+    for (const url of urls) source.shape.url.parse(url);
+    const pages = sourcesFromResult(
+      await client.callTool(
+        {
+          name: 'web_fetch',
+          arguments: {
+            urls: urls.slice(0, 5),
+            objective:
+              objective.length <= 200
+                ? objective
+                : 'Extract source evidence relevant to the supplied research queries.',
+            search_queries,
+            session_id,
+          },
+        },
+        undefined,
+        { signal: boundedSignal },
+      ),
+      warn,
+    );
+    if (urls.length > 5)
+      warn('Only the first five URLs were read; coverage is limited.');
+    if (pages.length < Math.min(urls.length, 5))
+      warn('Some requested sources could not be read; coverage is incomplete.');
+    boundedSignal.throwIfAborted();
+    if (!pages.length)
+      throw new Error('Parallel could not extract usable source evidence.');
+    return pages;
+  } catch (error: any) {
+    if (error?.message?.startsWith('Parallel could not complete')) {
+      throw error;
+    }
+    if (!config.parallelApiKey && !signal.aborted) {
+      try {
+        const local = await localWebSources(request, signal);
+        if (local.length > 0) return local;
+      } catch {}
+    }
+    throw error;
+  } finally {
+    await client.close().catch(() => {});
+  }
 }

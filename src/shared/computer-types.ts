@@ -30,7 +30,17 @@ export interface ComputerStatus {
   control?: ComputerControl;
   error?: string;
 }
-const path = z.string().max(4096);
+const path = z
+  .string()
+  .max(1024)
+  .refine(
+    (p) =>
+      !p.startsWith('/') &&
+      !p.includes('\\') &&
+      !p.includes('\0') &&
+      !p.split('/').some((s) => s === '..'),
+    'Use a relative workspace path without traversal.',
+  );
 const empty = z.object({}).strict();
 const ref = {
   ref: z.string().min(1).max(100),
@@ -71,14 +81,14 @@ export const computerInputs = {
   files_write: z
     .object({
       path: path.refine((p) => p.length > 0),
-      contents: z.string().max(100_000_000),
+      contents: z.string().max(100000),
       append: z.boolean().optional(),
     })
     .strict(),
   exec: z
     .object({
-      command: z.string().trim().min(1).max(100_000),
-      timeoutMs: z.number().int().min(1000).max(600_000).default(120_000),
+      command: z.string().trim().min(1).max(8000),
+      timeoutMs: z.number().int().min(1000).max(60000).default(30000),
     })
     .strict(),
   human_click: z
@@ -92,5 +102,19 @@ export const computerInputs = {
   human_scroll: z
     .object({ deltaY: z.number().finite().min(-10000).max(10000) })
     .strict(),
+};
+
+export const hostComputerInputs = {
+  files_list: z.object({ path: z.string().max(4096).default('') }),
+  files_read: z.object({ path: z.string().min(1).max(4096) }),
+  files_write: z.object({
+    path: z.string().min(1).max(4096),
+    contents: z.string().max(100_000_000),
+    append: z.boolean().optional(),
+  }),
+  exec: z.object({
+    command: z.string().trim().min(1).max(100_000),
+    timeoutMs: z.number().int().min(1000).max(600_000).default(120_000),
+  }),
 };
 export type ComputerAction = keyof typeof computerInputs;

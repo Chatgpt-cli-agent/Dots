@@ -6,7 +6,15 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { validateLearningSettings } from '../shared/learning.js';
-import type { CallReceipt, Conversation, Dot, Space } from '../shared/types.js';
+import type {
+  CallReceipt,
+  Conversation,
+  Dot,
+  NativeMessage,
+  NativeRun,
+  NativeToolExecution,
+  Space,
+} from '../shared/types.js';
 export class WorkspaceStore {
   private db: DatabaseSync;
   readonly pages: Pages;
@@ -25,7 +33,9 @@ export class WorkspaceStore {
       CREATE TABLE IF NOT EXISTS task_threads(taskId TEXT PRIMARY KEY, threadId TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS calls(id TEXT PRIMARY KEY, threadId TEXT NOT NULL, startedAt INTEGER NOT NULL, endedAt INTEGER, status TEXT NOT NULL, transcript TEXT NOT NULL, error TEXT);
       CREATE TABLE IF NOT EXISTS captures(threadId TEXT PRIMARY KEY, value TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS thread_messages(id TEXT PRIMARY KEY, threadId TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, createdAt INTEGER NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS thread_messages(id TEXT PRIMARY KEY, threadId TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, createdAt INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, threadId TEXT NOT NULL, dotId TEXT NOT NULL, parentRunId TEXT, status TEXT NOT NULL, error TEXT, startedAt INTEGER NOT NULL, finishedAt INTEGER, metadata TEXT);
+      CREATE TABLE IF NOT EXISTS tool_executions(id TEXT PRIMARY KEY, runId TEXT NOT NULL, threadId TEXT NOT NULL, toolName TEXT NOT NULL, args TEXT NOT NULL, result TEXT, status TEXT NOT NULL, approvalRequired INTEGER NOT NULL DEFAULT 0, approved INTEGER NOT NULL DEFAULT 0, error TEXT, createdAt INTEGER NOT NULL, finishedAt INTEGER);`);
     for (const [table, column, definition] of [
       ['dots', 'learningContainerId', 'TEXT'],
       ['dots', 'skillDeliveryEnabled', 'INTEGER NOT NULL DEFAULT 0'],
@@ -33,7 +43,20 @@ export class WorkspaceStore {
       ['dots', 'composioToolkits', "TEXT NOT NULL DEFAULT '[]'"],
       ['dots', 'composioSessionId', 'TEXT'],
       ['dots', 'composioPolicyHash', 'TEXT'],
+      ['dots', 'modelEndpoint', 'TEXT'],
+      ['dots', 'modelId', 'TEXT'],
+      ['dots', 'contextLimit', 'INTEGER'],
+      ['dots', 'maxCompletionTokens', 'INTEGER'],
+      ['dots', 'apiKey', 'TEXT'],
       ['thread_bindings', 'learningContainerId', 'TEXT'],
+      ['thread_bindings', 'updatedAt', 'INTEGER'],
+      ['thread_bindings', 'archivedAt', 'INTEGER'],
+      ['thread_bindings', 'metadata', 'TEXT'],
+      ['thread_messages', 'runId', 'TEXT'],
+      ['thread_messages', 'toolCalls', 'TEXT'],
+      ['thread_messages', 'toolCallId', 'TEXT'],
+      ['thread_messages', 'status', 'TEXT'],
+      ['thread_messages', 'metadata', 'TEXT'],
     ]) {
       if (
         !this.db
@@ -119,6 +142,18 @@ export class WorkspaceStore {
         appsAllowed: !!row.appsAllowed,
         composioToolkits: JSON.parse(String(row.composioToolkits ?? '[]')),
         skillDeliveryEnabled: !!row.skillDeliveryEnabled,
+        modelEndpoint: row.modelEndpoint ? String(row.modelEndpoint) : undefined,
+        modelId: row.modelId ? String(row.modelId) : undefined,
+        contextLimit:
+          row.contextLimit !== null && row.contextLimit !== undefined
+            ? Number(row.contextLimit)
+            : undefined,
+        maxCompletionTokens:
+          row.maxCompletionTokens !== null &&
+          row.maxCompletionTokens !== undefined
+            ? Number(row.maxCompletionTokens)
+            : undefined,
+        apiKey: row.apiKey ? String(row.apiKey) : undefined,
       })) as unknown as Dot[];
   }
   dot(id: string) {
@@ -135,6 +170,11 @@ export class WorkspaceStore {
     skillDeliveryEnabled = false,
     appsAllowed = false,
     composioToolkits: string[] = [],
+    modelEndpoint?: string,
+    modelId?: string,
+    contextLimit?: number,
+    maxCompletionTokens?: number,
+    apiKey?: string,
   ): Dot {
     this.validateSpaceAccess(spaceId, spaceIds);
     validateLearningSettings(learningContainerId, skillDeliveryEnabled);
@@ -152,13 +192,18 @@ export class WorkspaceStore {
       composioPolicyHash: null,
       learningContainerId,
       skillDeliveryEnabled,
+      modelEndpoint,
+      modelId,
+      contextLimit,
+      maxCompletionTokens,
+      apiKey,
       createdAt: Date.now(),
     };
     this.db.exec('BEGIN');
     try {
       this.db
         .prepare(
-          'INSERT INTO dots (id, spaceId, name, instructions, researchAllowed, memoryAllowed, createdAt, learningContainerId, skillDeliveryEnabled, appsAllowed, composioToolkits) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          'INSERT INTO dots (id, spaceId, name, instructions, researchAllowed, memoryAllowed, createdAt, learningContainerId, skillDeliveryEnabled, appsAllowed, composioToolkits, modelEndpoint, modelId, contextLimit, maxCompletionTokens, apiKey) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         )
         .run(
           dot.id,
@@ -172,6 +217,11 @@ export class WorkspaceStore {
           +skillDeliveryEnabled,
           +appsAllowed,
           JSON.stringify(dot.composioToolkits),
+          modelEndpoint ?? null,
+          modelId ?? null,
+          contextLimit ?? null,
+          maxCompletionTokens ?? null,
+          apiKey ?? null,
         );
       for (const id of dot.spaceIds)
         this.db.prepare('INSERT INTO dot_spaces VALUES (?, ?)').run(dot.id, id);
@@ -196,14 +246,21 @@ export class WorkspaceStore {
   }
   updateDot(
     id: string,
-    patch: Pick<
-      Dot,
-      | 'name'
-      | 'instructions'
-      | 'researchAllowed'
-      | 'memoryAllowed'
-      | 'appsAllowed'
-      | 'composioToolkits'
+    patch: Partial<
+      Pick<
+        Dot,
+        | 'name'
+        | 'instructions'
+        | 'researchAllowed'
+        | 'memoryAllowed'
+        | 'appsAllowed'
+        | 'composioToolkits'
+        | 'modelEndpoint'
+        | 'modelId'
+        | 'contextLimit'
+        | 'maxCompletionTokens'
+        | 'apiKey'
+      >
     > & {
       spaceId?: string;
       spaceIds?: string[];
@@ -223,21 +280,59 @@ export class WorkspaceStore {
     const skillDeliveryEnabled =
       patch.skillDeliveryEnabled ?? current.skillDeliveryEnabled ?? false;
     validateLearningSettings(learningContainerId, skillDeliveryEnabled);
+    const name = patch.name ?? current.name;
+    const instructions = patch.instructions ?? current.instructions;
+    const researchAllowed =
+      patch.researchAllowed !== undefined
+        ? patch.researchAllowed
+        : current.researchAllowed;
+    const memoryAllowed =
+      patch.memoryAllowed !== undefined
+        ? patch.memoryAllowed
+        : current.memoryAllowed;
+    const appsAllowed =
+      patch.appsAllowed !== undefined ? patch.appsAllowed : current.appsAllowed;
+    const composioToolkits =
+      patch.composioToolkits !== undefined
+        ? patch.composioToolkits
+        : current.composioToolkits;
+    const modelEndpoint =
+      patch.modelEndpoint !== undefined
+        ? patch.modelEndpoint
+        : current.modelEndpoint;
+    const modelId =
+      patch.modelId !== undefined ? patch.modelId : current.modelId;
+    const contextLimit =
+      patch.contextLimit !== undefined
+        ? patch.contextLimit
+        : current.contextLimit;
+    const maxCompletionTokens =
+      patch.maxCompletionTokens !== undefined
+        ? patch.maxCompletionTokens
+        : current.maxCompletionTokens;
+    const apiKey =
+      patch.apiKey !== undefined ? patch.apiKey : current.apiKey;
+
     this.db.exec('BEGIN');
     try {
       this.db
         .prepare(
-          'UPDATE dots SET name=?, instructions=?, researchAllowed=?, memoryAllowed=?, learningContainerId=?, skillDeliveryEnabled=?, appsAllowed=?, composioToolkits=? WHERE id=?',
+          'UPDATE dots SET name=?, instructions=?, researchAllowed=?, memoryAllowed=?, learningContainerId=?, skillDeliveryEnabled=?, appsAllowed=?, composioToolkits=?, modelEndpoint=?, modelId=?, contextLimit=?, maxCompletionTokens=?, apiKey=? WHERE id=?',
         )
         .run(
-          patch.name,
-          patch.instructions,
-          +patch.researchAllowed,
-          +patch.memoryAllowed,
+          name,
+          instructions,
+          +researchAllowed,
+          +memoryAllowed,
           learningContainerId,
           +skillDeliveryEnabled,
-          +patch.appsAllowed,
-          JSON.stringify([...new Set(patch.composioToolkits)].sort()),
+          +appsAllowed,
+          JSON.stringify([...new Set(composioToolkits)].sort()),
+          modelEndpoint ?? null,
+          modelId ?? null,
+          contextLimit ?? null,
+          maxCompletionTokens ?? null,
+          apiKey ?? null,
           id,
         );
       this.db
@@ -260,27 +355,34 @@ export class WorkspaceStore {
       )
       .run(sessionId, policyHash, id);
   }
-  conversations(): Conversation[] {
+  conversations(includeArchived = false): Conversation[] {
+    const query = includeArchived
+      ? 'SELECT * FROM thread_bindings WHERE ownerId=? ORDER BY COALESCE(updatedAt, createdAt) DESC'
+      : 'SELECT * FROM thread_bindings WHERE ownerId=? AND archivedAt IS NULL ORDER BY COALESCE(updatedAt, createdAt) DESC';
     return this.db
-      .prepare(
-        'SELECT * FROM thread_bindings WHERE ownerId=? ORDER BY createdAt DESC',
-      )
-      .all(this.ownerId) as unknown as Conversation[];
+      .prepare(query)
+      .all(this.ownerId)
+      .map((row: any) => ({
+        ...row,
+        metadata: row.metadata ? JSON.parse(row.metadata) : null,
+      })) as unknown as Conversation[];
   }
   bindThread(id: string, dotId: string, title: string): Conversation {
     const dot = this.dot(dotId);
     if (!dot) throw new Error('Dot not found.');
+    const now = Date.now();
     const value: Conversation = {
       id,
       dotId,
       ownerId: this.ownerId,
       title,
-      createdAt: Date.now(),
+      createdAt: now,
+      updatedAt: now,
       learningContainerId: dot.learningContainerId ?? null,
     };
     this.db
       .prepare(
-        'INSERT INTO thread_bindings (id, dotId, ownerId, title, createdAt, learningContainerId) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO thread_bindings (id, dotId, ownerId, title, createdAt, updatedAt, learningContainerId) VALUES (?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         id,
@@ -288,15 +390,47 @@ export class WorkspaceStore {
         this.ownerId,
         title,
         value.createdAt,
+        now,
         value.learningContainerId ?? null,
       );
     return value;
   }
-  requireThread(id: string, dotId?: string): Conversation {
-    const thread = this.conversations().find((thread) => thread.id === id);
+  requireThread(
+    id: string,
+    dotId?: string,
+    includeArchived = false,
+  ): Conversation {
+    const thread = this.conversations(includeArchived).find(
+      (thread) => thread.id === id,
+    );
     if (!thread || (dotId && thread.dotId !== dotId))
       throw new Error('Conversation does not belong to this Dot and owner.');
     return thread;
+  }
+  archiveThread(id: string) {
+    this.requireThread(id, undefined, true);
+    this.db
+      .prepare('UPDATE thread_bindings SET archivedAt=?, updatedAt=? WHERE id=?')
+      .run(Date.now(), Date.now(), id);
+  }
+  unarchiveThread(id: string) {
+    this.requireThread(id, undefined, true);
+    this.db
+      .prepare(
+        'UPDATE thread_bindings SET archivedAt=NULL, updatedAt=? WHERE id=?',
+      )
+      .run(Date.now(), id);
+  }
+  updateThreadTitle(id: string, title: string) {
+    this.requireThread(id, undefined, true);
+    this.db
+      .prepare('UPDATE thread_bindings SET title=?, updatedAt=? WHERE id=?')
+      .run(title, Date.now(), id);
+  }
+  touchThread(id: string) {
+    this.db
+      .prepare('UPDATE thread_bindings SET updatedAt=? WHERE id=?')
+      .run(Date.now(), id);
   }
   bindTask(taskId: string, threadId: string) {
     this.requireThread(threadId);
@@ -398,26 +532,357 @@ export class WorkspaceStore {
       .get(threadId);
     return typeof row?.value === 'string' ? JSON.parse(row.value) : null;
   }
-  saveMessage(threadId: string, role: string, content: unknown) {
+  saveMessage(
+    threadId: string,
+    role: string,
+    content: unknown,
+    options?: {
+      id?: string;
+      runId?: string | null;
+      toolCalls?: Array<{ id: string; name: string; args: unknown }>;
+      toolCallId?: string | null;
+      status?: 'pending' | 'success' | 'failed' | 'cancelled';
+      metadata?: Record<string, unknown> | null;
+      createdAt?: number;
+    },
+  ): NativeMessage {
+    const id = options?.id || randomUUID();
     const text = typeof content === 'string' ? content : JSON.stringify(content);
-    this.db
-      .prepare(
-        'INSERT INTO thread_messages (id, threadId, role, content, createdAt) VALUES (?, ?, ?, ?, ?)',
-      )
-      .run(randomUUID(), threadId, role, text, Date.now());
+    const createdAt = options?.createdAt || Date.now();
+    const runId = options?.runId ?? null;
+    const toolCalls = options?.toolCalls ? JSON.stringify(options.toolCalls) : null;
+    const toolCallId = options?.toolCallId ?? null;
+    const status = options?.status ?? null;
+    const metadata = options?.metadata ? JSON.stringify(options.metadata) : null;
+
+    const existing = this.db
+      .prepare('SELECT id FROM thread_messages WHERE id=?')
+      .get(id);
+
+    if (existing) {
+      this.db
+        .prepare(
+          'UPDATE thread_messages SET role=?, content=?, runId=?, toolCalls=?, toolCallId=?, status=?, metadata=? WHERE id=?',
+        )
+        .run(role, text, runId, toolCalls, toolCallId, status, metadata, id);
+    } else {
+      this.db
+        .prepare(
+          'INSERT INTO thread_messages (id, threadId, role, content, createdAt, runId, toolCalls, toolCallId, status, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        )
+        .run(
+          id,
+          threadId,
+          role,
+          text,
+          createdAt,
+          runId,
+          toolCalls,
+          toolCallId,
+          status,
+          metadata,
+        );
+    }
+    this.touchThread(threadId);
+    return {
+      id,
+      threadId,
+      role: role as NativeMessage['role'],
+      content: text,
+      createdAt,
+      runId,
+      toolCalls: options?.toolCalls,
+      toolCallId,
+      status: options?.status,
+      metadata: options?.metadata,
+    };
   }
-  getMessages(threadId: string): { role: string; content?: unknown }[] {
+
+  getNativeMessages(threadId: string): NativeMessage[] {
     const rows = this.db
       .prepare(
-        'SELECT role, content FROM thread_messages WHERE threadId=? ORDER BY createdAt ASC',
+        'SELECT * FROM thread_messages WHERE threadId=? ORDER BY createdAt ASC, rowid ASC',
       )
-      .all(threadId) as unknown as { role: string; content: string }[];
-    return rows.map((r) => {
-      let parsed: unknown = r.content;
+      .all(threadId) as unknown as any[];
+    return rows.map((r) => ({
+      id: String(r.id),
+      threadId: String(r.threadId),
+      role: r.role as NativeMessage['role'],
+      content: String(r.content),
+      createdAt: Number(r.createdAt),
+      runId: r.runId ? String(r.runId) : null,
+      toolCalls: r.toolCalls ? JSON.parse(r.toolCalls) : undefined,
+      toolCallId: r.toolCallId ? String(r.toolCallId) : null,
+      status: r.status ? (r.status as NativeMessage['status']) : undefined,
+      metadata: r.metadata ? JSON.parse(r.metadata) : null,
+    }));
+  }
+
+  getMessages(threadId: string): { role: string; content?: unknown }[] {
+    return this.getNativeMessages(threadId).map((m) => {
+      let parsed: unknown = m.content;
       try {
-        parsed = JSON.parse(r.content);
+        parsed = JSON.parse(m.content);
       } catch {}
-      return { role: r.role, content: parsed };
+      return { role: m.role, content: parsed };
     });
+  }
+
+  createRun(run: {
+    id?: string;
+    threadId: string;
+    dotId: string;
+    status?: NativeRun['status'];
+    parentRunId?: string | null;
+    metadata?: Record<string, unknown> | null;
+  }): NativeRun {
+    const id = run.id || randomUUID();
+    const startedAt = Date.now();
+    const status = run.status ?? 'running';
+    const metadataStr = run.metadata ? JSON.stringify(run.metadata) : null;
+    const parentRunId = run.parentRunId ?? null;
+    const existing = this.db.prepare('SELECT id FROM runs WHERE id=?').get(id);
+    if (existing) {
+      this.db
+        .prepare(
+          'UPDATE runs SET threadId=?, dotId=?, parentRunId=?, status=?, error=NULL, startedAt=?, finishedAt=NULL, metadata=? WHERE id=?',
+        )
+        .run(
+          run.threadId,
+          run.dotId,
+          parentRunId,
+          status,
+          startedAt,
+          metadataStr,
+          id,
+        );
+    } else {
+      this.db
+        .prepare(
+          'INSERT INTO runs (id, threadId, dotId, parentRunId, status, error, startedAt, finishedAt, metadata) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?)',
+        )
+        .run(
+          id,
+          run.threadId,
+          run.dotId,
+          parentRunId,
+          status,
+          startedAt,
+          metadataStr,
+        );
+    }
+    return {
+      id,
+      threadId: run.threadId,
+      dotId: run.dotId,
+      parentRunId: run.parentRunId ?? null,
+      status,
+      error: null,
+      startedAt,
+      finishedAt: null,
+      metadata: run.metadata,
+    };
+  }
+
+  updateRun(
+    id: string,
+    patch: Partial<
+      Pick<NativeRun, 'status' | 'error' | 'finishedAt' | 'metadata'>
+    >,
+  ): NativeRun {
+    const current = this.getRun(id);
+    if (!current) throw new Error('Run not found.');
+    const status = patch.status ?? current.status;
+    const error = patch.error !== undefined ? patch.error : current.error;
+    const finishedAt =
+      patch.finishedAt !== undefined ? patch.finishedAt : current.finishedAt;
+    const metadata =
+      patch.metadata !== undefined ? patch.metadata : current.metadata;
+    const metadataStr = metadata ? JSON.stringify(metadata) : null;
+
+    this.db
+      .prepare(
+        'UPDATE runs SET status=?, error=?, finishedAt=?, metadata=? WHERE id=?',
+      )
+      .run(status, error ?? null, finishedAt ?? null, metadataStr, id);
+
+    return {
+      ...current,
+      status,
+      error,
+      finishedAt,
+      metadata,
+    };
+  }
+
+  getRun(id: string): NativeRun | null {
+    const row = this.db
+      .prepare('SELECT * FROM runs WHERE id=?')
+      .get(id) as any;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      threadId: String(row.threadId),
+      dotId: String(row.dotId),
+      parentRunId: row.parentRunId ? String(row.parentRunId) : null,
+      status: row.status as NativeRun['status'],
+      error: row.error ? String(row.error) : null,
+      startedAt: Number(row.startedAt),
+      finishedAt: row.finishedAt ? Number(row.finishedAt) : null,
+      metadata: row.metadata ? JSON.parse(row.metadata) : null,
+    };
+  }
+
+  getActiveRun(threadId: string): NativeRun | null {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM runs WHERE threadId=? AND status IN ('queued', 'running') ORDER BY startedAt DESC LIMIT 1",
+      )
+      .get(threadId) as any;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      threadId: String(row.threadId),
+      dotId: String(row.dotId),
+      parentRunId: row.parentRunId ? String(row.parentRunId) : null,
+      status: row.status as NativeRun['status'],
+      error: row.error ? String(row.error) : null,
+      startedAt: Number(row.startedAt),
+      finishedAt: row.finishedAt ? Number(row.finishedAt) : null,
+      metadata: row.metadata ? JSON.parse(row.metadata) : null,
+    };
+  }
+
+  cancelActiveRuns(threadId: string, error = 'Run cancelled.') {
+    this.db
+      .prepare(
+        "UPDATE runs SET status='cancelled', error=?, finishedAt=? WHERE threadId=? AND status IN ('queued', 'running')",
+      )
+      .run(error, Date.now(), threadId);
+  }
+
+  createToolExecution(execution: {
+    id?: string;
+    runId: string;
+    threadId: string;
+    toolCallId?: string;
+    toolName: string;
+    args?: Record<string, unknown>;
+    approvalRequired?: boolean;
+  }): NativeToolExecution {
+    const id = execution.id || randomUUID();
+    const createdAt = Date.now();
+    const status = execution.approvalRequired ? 'awaiting_approval' : 'pending';
+    const safeArgs = execution.args ?? (execution as any).input ?? {};
+    this.db
+      .prepare(
+        'INSERT INTO tool_executions (id, runId, threadId, toolName, args, result, status, approvalRequired, approved, error, createdAt, finishedAt) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 0, NULL, ?, NULL)',
+      )
+      .run(
+        id,
+        execution.runId,
+        execution.threadId,
+        execution.toolName,
+        JSON.stringify(safeArgs),
+        status,
+        execution.approvalRequired ? 1 : 0,
+        createdAt,
+      );
+    return {
+      id,
+      runId: execution.runId,
+      threadId: execution.threadId,
+      toolCallId: execution.toolCallId,
+      toolName: execution.toolName,
+      args: safeArgs,
+      status,
+      approvalRequired: !!execution.approvalRequired,
+      approved: false,
+      createdAt,
+    };
+  }
+
+  updateToolExecution(
+    id: string,
+    patch: Partial<
+      Pick<
+        NativeToolExecution,
+        'result' | 'status' | 'approved' | 'error' | 'finishedAt'
+      >
+    >,
+  ): NativeToolExecution {
+    const current = this.getToolExecution(id);
+    if (!current) throw new Error('Tool execution not found.');
+    const result =
+      patch.result !== undefined
+        ? patch.result
+        : (patch as any).output !== undefined
+          ? (patch as any).output
+          : current.result;
+    const resultStr = result !== undefined ? JSON.stringify(result) : null;
+    const status = patch.status ?? current.status;
+    const approved =
+      patch.approved !== undefined ? patch.approved : current.approved;
+    const error = patch.error !== undefined ? patch.error : current.error;
+    const finishedAt =
+      patch.finishedAt !== undefined ? patch.finishedAt : current.finishedAt;
+
+    this.db
+      .prepare(
+        'UPDATE tool_executions SET result=?, status=?, approved=?, error=?, finishedAt=? WHERE id=?',
+      )
+      .run(resultStr ?? null, status, approved ? 1 : 0, error ?? null, finishedAt ?? null, id);
+
+    return {
+      ...current,
+      result,
+      status,
+      approved,
+      error,
+      finishedAt,
+    };
+  }
+
+  getToolExecution(id: string): NativeToolExecution | null {
+    const row = this.db
+      .prepare('SELECT * FROM tool_executions WHERE id=?')
+      .get(id) as any;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      runId: String(row.runId),
+      threadId: String(row.threadId),
+      toolName: String(row.toolName),
+      args: row.args ? JSON.parse(row.args) : {},
+      result: row.result ? JSON.parse(row.result) : undefined,
+      status: row.status as NativeToolExecution['status'],
+      approvalRequired: Boolean(row.approvalRequired),
+      approved: Boolean(row.approved),
+      error: row.error ? String(row.error) : null,
+      createdAt: Number(row.createdAt),
+      finishedAt: row.finishedAt ? Number(row.finishedAt) : null,
+    };
+  }
+
+  getToolExecutions(runId: string): NativeToolExecution[] {
+    const rows = this.db
+      .prepare(
+        'SELECT * FROM tool_executions WHERE runId=? ORDER BY createdAt ASC',
+      )
+      .all(runId) as any[];
+    return rows.map((row) => ({
+      id: String(row.id),
+      runId: String(row.runId),
+      threadId: String(row.threadId),
+      toolName: String(row.toolName),
+      args: row.args ? JSON.parse(row.args) : {},
+      result: row.result ? JSON.parse(row.result) : undefined,
+      status: row.status as NativeToolExecution['status'],
+      approvalRequired: Boolean(row.approvalRequired),
+      approved: Boolean(row.approved),
+      error: row.error ? String(row.error) : null,
+      createdAt: Number(row.createdAt),
+      finishedAt: row.finishedAt ? Number(row.finishedAt) : null,
+    }));
   }
 }

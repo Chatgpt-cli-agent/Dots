@@ -8,6 +8,10 @@ import {
   createCopilotHonoHandler,
   type CopilotHonoApp,
 } from '@copilotkit/runtime/v2';
+import { EventType } from '@ag-ui/core';
+import { lastValueFrom, toArray } from 'rxjs';
+import { voiceReceiptMessagePrefix } from '../shared/voice-receipt.js';
+import { scheduledTaskMessagePrefix } from '../shared/scheduled-message.js';
 import { createSlackChannel } from './slack-channel.js';
 export { slackIdentity } from './slack-channel.js';
 import { Store } from './store.js';
@@ -70,8 +74,12 @@ export class Platform {
       });
     }
     this.pages = new PageService(workspace, () => {
-      return this.intelligence || this.localIntelligence;
+      if (this.intelligence) return this.intelligence;
+      if (this.config.nativeMode) return this.localIntelligence;
+      this.requireReady();
+      return this.intelligence!;
     });
+    if (!config.intelligenceKey && !config.nativeMode) return;
     const channels = [];
     if (config.slackChannel && config.slackTeam && config.slackUsers.length) {
       const dotId = config.slackDotId ?? workspace.dots()[0].id;
@@ -94,47 +102,60 @@ export class Platform {
       });
       channels.push(slack);
     }
-    const runtime = new CopilotRuntime({
-      ...(this.intelligence ? { intelligence: this.intelligence } : {}),
-      telemetryId: this.setupTelemetry.identity,
-      telemetryProperties: this.setupTelemetry.metadata,
-      identifyUser: async () => ({
-        id: workspace.ownerId,
-        name: 'OpenDots owner',
-      }),
-      agents: async () => {
-        const entries: [string, DotAgent][] = [];
-        for (const dot of workspace.dots()) {
-          entries.push([
+    const agents = async () => {
+      const entries: [string, DotAgent][] = [];
+      for (const dot of workspace.dots()) {
+        entries.push([
+          dot.id,
+          new DotAgent(
+            store,
+            workspace,
+            config,
             dot.id,
-            new DotAgent(
-              store,
-              workspace,
-              config,
-              dot.id,
-              false,
-              this.setupTelemetry,
-            ),
-          ]);
-        }
-        for (const thread of workspace.conversations()) {
-          entries.push([
-            `chat-${thread.id}`,
-            new DotAgent(
-              store,
-              workspace,
-              config,
-              thread.dotId,
-              false,
-              this.setupTelemetry,
-            ),
-          ]);
-        }
-        return Object.fromEntries(entries);
-      },
-      channels,
-      generateThreadNames: true,
-    });
+            false,
+            this.setupTelemetry,
+          ),
+        ]);
+      }
+      for (const thread of workspace.conversations()) {
+        entries.push([
+          `chat-${thread.id}`,
+          new DotAgent(
+            store,
+            workspace,
+            config,
+            thread.dotId,
+            false,
+            this.setupTelemetry,
+          ),
+        ]);
+      }
+      return Object.fromEntries(entries);
+    };
+    const runtime = this.intelligence
+      ? new CopilotRuntime({
+          intelligence: this.intelligence,
+          telemetryId: this.setupTelemetry.identity,
+          telemetryProperties: this.setupTelemetry.metadata,
+          identifyUser: async () => ({
+            id: workspace.ownerId,
+            name: 'OpenDots owner',
+          }),
+          agents,
+          channels: channels as any,
+          generateThreadNames: true,
+        })
+      : new (CopilotRuntime as any)({
+          telemetryId: this.setupTelemetry.identity,
+          telemetryProperties: this.setupTelemetry.metadata,
+          identifyUser: async () => ({
+            id: workspace.ownerId,
+            name: 'OpenDots owner',
+          }),
+          agents,
+          channels: channels as any,
+          generateThreadNames: true,
+        });
     this.handler = createCopilotHonoHandler({
       runtime,
       basePath: '/api/copilotkit',
@@ -212,6 +233,164 @@ export class Platform {
       .join('\n')
       .slice(-12000);
   }
+  async handleNativeResource(
+    request: Request,
+    body: any,
+  ): Promise<Response | null> {
+    const url = new URL(request.url);
+    const prefix = '/api/copilotkit';
+    let path = '';
+    let method = request.method;
+    let resourceBody: any = body;
+
+    if (url.pathname.startsWith(`${prefix}/threads`)) {
+      path = url.pathname.slice(prefix.length) + url.search;
+    } else if (
+      body &&
+      body.method === 'resource/request' &&
+      typeof body.params?.path === 'string'
+    ) {
+      path = body.params.path;
+      method = (body.params.httpMethod || 'GET').toUpperCase();
+      resourceBody = body.body;
+    }
+
+    if (!path.startsWith('/threads')) return null;
+
+    const [rawPath, search] = path.split('?');
+    const searchParams = new URLSearchParams(search || '');
+
+    if (rawPath === '/threads') {
+      if (method === 'GET') {
+        const agentId = searchParams.get('agentId');
+        const includeArchived = searchParams.get('includeArchived') === 'true';
+        const threads = this.workspace
+          .conversations(includeArchived)
+          .filter((t) => {
+            if (!agentId) return true;
+            if (agentId === t.dotId) return true;
+            if (agentId === `chat-${t.id}`) return true;
+            return false;
+          })
+          .map((t) => ({
+            id: t.id,
+            name: t.title,
+            agentId: t.dotId,
+            createdAt: new Date(t.createdAt).toISOString(),
+            updatedAt: new Date(t.updatedAt ?? t.createdAt).toISOString(),
+            archived: Boolean(t.archivedAt),
+          }));
+        return Response.json({ threads, nextCursor: null });
+      }
+      if (method === 'POST') {
+        const dotId = resourceBody?.agentId || this.workspace.dots()[0]?.id;
+        const title = resourceBody?.name || 'A new thought';
+        const conv = await this.createConversation(dotId, title);
+        return Response.json({
+          id: conv.id,
+          name: conv.title,
+          agentId: conv.dotId,
+          createdAt: new Date(conv.createdAt).toISOString(),
+          updatedAt: new Date(conv.updatedAt ?? conv.createdAt).toISOString(),
+          archived: false,
+        });
+      }
+    }
+
+    const messagesMatch = rawPath.match(/^\/threads\/([^/]+)\/messages$/);
+    if (messagesMatch) {
+      const threadId = messagesMatch[1];
+      if (method === 'GET') {
+        const rawMessages = this.workspace.getNativeMessages(threadId);
+        const messages = rawMessages.map((m) => {
+          let content: unknown = m.content;
+          try {
+            if (m.role !== 'user' && m.role !== 'assistant') {
+              content = JSON.parse(m.content);
+            }
+          } catch {}
+          return {
+            id: m.id,
+            role: m.role,
+            content,
+            createdAt: new Date(m.createdAt).toISOString(),
+            ...(m.toolCalls && m.toolCalls.length > 0
+              ? { toolCalls: m.toolCalls }
+              : {}),
+            ...(m.toolCallId ? { toolCallId: m.toolCallId } : {}),
+          };
+        });
+        return Response.json({ messages, nextCursor: null });
+      }
+      if (method === 'POST') {
+        const msg = this.workspace.saveMessage(
+          threadId,
+          resourceBody?.role || 'user',
+          resourceBody?.content || '',
+          {
+            id: resourceBody?.id,
+            toolCalls: resourceBody?.toolCalls,
+            toolCallId: resourceBody?.toolCallId,
+            metadata: resourceBody?.metadata,
+          },
+        );
+        return Response.json(msg);
+      }
+    }
+
+    const singleMatch = rawPath.match(/^\/threads\/([^/]+)$/);
+    if (singleMatch) {
+      const threadId = singleMatch[1];
+      if (method === 'GET') {
+        const thread = this.workspace
+          .conversations(true)
+          .find((t) => t.id === threadId);
+        if (!thread)
+          return Response.json({ error: 'Thread not found' }, { status: 404 });
+        return Response.json({
+          id: thread.id,
+          name: thread.title,
+          agentId: thread.dotId,
+          createdAt: new Date(thread.createdAt).toISOString(),
+          updatedAt: new Date(thread.updatedAt ?? thread.createdAt).toISOString(),
+          archived: Boolean(thread.archivedAt),
+        });
+      }
+      if (method === 'DELETE') {
+        this.workspace.archiveThread(threadId);
+        return new Response(null, { status: 204 });
+      }
+      if (method === 'PATCH') {
+        if (resourceBody?.name) {
+          this.workspace.updateThreadTitle(threadId, resourceBody.name);
+        }
+        if (resourceBody?.archived !== undefined) {
+          if (resourceBody.archived) {
+            this.workspace.archiveThread(threadId);
+          } else {
+            this.workspace.unarchiveThread(threadId);
+          }
+        }
+        const thread = this.workspace
+          .conversations(true)
+          .find((t) => t.id === threadId);
+        return Response.json({
+          id: thread?.id ?? threadId,
+          name: thread?.title ?? '',
+          agentId: thread?.dotId ?? '',
+          createdAt: thread
+            ? new Date(thread.createdAt).toISOString()
+            : new Date().toISOString(),
+          updatedAt: thread
+            ? new Date(thread.updatedAt ?? thread.createdAt).toISOString()
+            : new Date().toISOString(),
+          archived: Boolean(thread?.archivedAt),
+        });
+      }
+    }
+
+    return null;
+  }
   async handle(request: Request): Promise<Response> {
     if (!this.handler)
       return Response.json(
@@ -237,7 +416,137 @@ export class Platform {
         { status: 403 },
       );
     }
+    const nativeRes = await this.handleNativeResource(request, body);
+    if (nativeRes) return nativeRes;
     return this.handler.fetch(request);
+  }
+  async runNativeTurn(
+    threadId: string,
+    prompt: string,
+    signal: AbortSignal,
+    metadata?: Record<string, unknown>,
+  ): Promise<string> {
+    this.requireReady();
+    signal.throwIfAborted();
+    const thread = this.workspace.requireThread(threadId);
+
+    // Cancel active runs for this thread (one active run per thread)
+    this.workspace.cancelActiveRuns(threadId);
+
+    const idPrefix =
+      metadata?.opendotsSource === 'voice_receipt'
+        ? voiceReceiptMessagePrefix
+        : metadata?.opendotsSource === 'scheduled_task'
+          ? scheduledTaskMessagePrefix
+          : '';
+    const userMsgId = `${idPrefix}${randomUUID()}`;
+
+    // 1. Persist incoming message before execution
+    this.workspace.saveMessage(threadId, 'user', prompt, {
+      id: userMsgId,
+      metadata,
+    });
+
+    // 2. Create native run record
+    const run = this.workspace.createRun({
+      threadId,
+      dotId: thread.dotId,
+      metadata,
+    });
+
+    // 3. Load authoritative history from SQLite
+    const history = this.workspace.getNativeMessages(threadId).map((m) => ({
+      id: m.id,
+      role: m.role,
+      content: m.content,
+    }));
+
+    // 4. Instantiate DotAgent
+    const agent = new DotAgent(
+      this.store,
+      this.workspace,
+      this.config,
+      thread.dotId,
+      false,
+      this.setupTelemetry,
+    );
+
+    let runError: Error | undefined;
+    let assistantText = '';
+    const abortController = new AbortController();
+    const abortHandler = () => {
+      abortController.abort();
+      agent.abortRun();
+      this.workspace.updateRun(run.id, {
+        status: 'cancelled',
+        finishedAt: Date.now(),
+      });
+    };
+    signal.addEventListener('abort', abortHandler, { once: true });
+
+    try {
+      signal.throwIfAborted();
+      const events = await lastValueFrom(
+        agent
+          .run({
+            runId: run.id,
+            threadId,
+            messages: history as any,
+            tools: [],
+            context: [],
+            state: {},
+            forwardedProps: {},
+          })
+          .pipe(toArray()),
+      );
+      signal.throwIfAborted();
+
+      for (const ev of events) {
+        if (ev.type === EventType.RUN_ERROR) {
+          runError = new Error((ev as any).message || 'Agent run error');
+        }
+        if (
+          (ev.type === EventType.TEXT_MESSAGE_CONTENT ||
+            ev.type === EventType.TEXT_MESSAGE_CHUNK) &&
+          typeof (ev as any).content === 'string'
+        ) {
+          assistantText += (ev as any).content;
+        }
+      }
+
+      if (runError) throw runError;
+      if (!assistantText.trim()) {
+        throw new Error(
+          'The current compute turn returned no assistant response.',
+        );
+      }
+
+      this.workspace.updateRun(run.id, {
+        status: 'completed',
+        finishedAt: Date.now(),
+      });
+      this.workspace.saveMessage(threadId, 'assistant', assistantText, {
+        runId: run.id,
+      });
+      this.workspace.touchThread(threadId);
+      return assistantText;
+    } catch (error) {
+      if (signal.aborted || abortController.signal.aborted) {
+        this.workspace.updateRun(run.id, {
+          status: 'cancelled',
+          finishedAt: Date.now(),
+        });
+      } else {
+        this.workspace.updateRun(run.id, {
+          status: 'failed',
+          error: error instanceof Error ? error.message : String(error),
+          finishedAt: Date.now(),
+        });
+      }
+      throw error;
+    } finally {
+      signal.removeEventListener('abort', abortHandler);
+    }
   }
   async turn(
     threadId: string,
@@ -246,6 +555,9 @@ export class Platform {
     metadata?: Record<string, unknown>,
   ): Promise<string> {
     this.requireReady();
+    if (this.config.nativeMode || !this.intelligence) {
+      return this.runNativeTurn(threadId, prompt, signal, metadata);
+    }
     const thread = this.workspace.requireThread(threadId);
     return runThreadTurn(
       this.config.runtimeUrl,

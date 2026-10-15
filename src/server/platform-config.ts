@@ -7,7 +7,7 @@ const INTELLIGENCE_API_KEY_ENV_NAMES = [
   'INTELLIGENCE_API_KEY',
 ] as const;
 export const INTELLIGENCE_KEY_MISSING_LABEL = `${INTELLIGENCE_API_KEY_ENV_NAMES[1]} (or ${INTELLIGENCE_API_KEY_ENV_NAMES[0]})`;
-export const DEFAULT_AGENT_RUN_TIMEOUT_MS = 600_000;
+export const DEFAULT_AGENT_RUN_TIMEOUT_MS = 90_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 export function intelligenceApiKeyFromEnv(
@@ -50,6 +50,7 @@ function firstNonEmptyEnvValue(
 }
 
 export interface PlatformConfig extends WebConfig {
+  nativeMode?: boolean;
   intelligenceKey?: string;
   intelligenceApiUrl?: string;
   intelligenceWsUrl?: string;
@@ -79,10 +80,21 @@ export function setupStatus(
   slack = 'not_configured',
   activationFailed = false,
 ): SetupStatus {
-  const missing = [
-    !config.apiKey && 'OPENAI_API_KEY',
-    !config.model && 'OPENAI_MODEL',
-  ].filter((item): item is string => !!item);
+  const hasCloudIntelligence = Boolean(config.intelligenceKey);
+  const hasNativeIntelligence = Boolean(config.nativeMode);
+  const hasIntelligence = hasCloudIntelligence || hasNativeIntelligence;
+
+  const missing: string[] = [];
+  if (!hasIntelligence) {
+    missing.push(INTELLIGENCE_KEY_MISSING_LABEL);
+  }
+  if (!config.model && !config.nativeMode) {
+    missing.push('OPENAI_MODEL');
+  }
+  if (!config.apiKey && !config.nativeMode) {
+    missing.push('OPENAI_API_KEY');
+  }
+
   const declaredSlack = !!(
     config.slackChannel &&
     config.slackTeam &&
@@ -95,9 +107,10 @@ export function setupStatus(
     : config.slackChannel || config.slackTeam || config.slackUsers.length
       ? 'setup_required'
       : 'not_configured';
+
   return {
-    intelligence: true,
-    model: !!(config.apiKey && config.model),
+    intelligence: hasIntelligence,
+    model: !!(config.model && (config.apiKey || config.nativeMode)),
     browser: !!(config.browserUrl && config.browserSecret),
     voice: !!(config.voiceKey && config.voiceModel && !missing.length),
     composio: !!config.composioApiKey,

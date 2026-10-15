@@ -93,7 +93,14 @@ export async function research(
   let pages: WebSource[];
   const limitations: string[] = [];
   let screenshot: string | undefined;
-  if ((config.webSearchProvider ?? 'parallel') === 'parallel') {
+  const searchProvider =
+    config.webSearchProvider ??
+    (config.parallelApiKey
+      ? 'parallel'
+      : config.browserUrl && config.browserSecret
+        ? 'browser'
+        : 'parallel');
+  if (searchProvider === 'parallel') {
     const urls = requestedUrls(prompt);
     progress(
       urls.length
@@ -144,7 +151,7 @@ export async function research(
     pages = [{ ...parsed.data, text: parsed.data.text.slice(0, 24000) }];
     screenshot = parsed.data.screenshot;
   }
-  progress('Sources captured. Writing a brief grounded in the evidence.');
+  progress('Source captured. Writing a brief grounded in the evidence.');
   signal.throwIfAborted();
   const completion = await fetch(
     `${config.baseUrl.replace(/\/$/, '')}/chat/completions`,

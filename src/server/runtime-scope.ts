@@ -9,8 +9,8 @@ export function validateRuntimeScope(
   const deny = () => {
     throw new Error('This runtime route is not enabled in OpenDots.');
   };
-  if (!url.pathname.startsWith(prefix)) return deny();
-  const path = url.pathname.slice(prefix.length);
+  if (!url.pathname.startsWith(prefix) && url.pathname !== '/api/copilotkit') return deny();
+  const path = url.pathname === '/api/copilotkit' ? '' : url.pathname.slice(prefix.length);
   const data =
     body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
   const id = (value: string) => {
@@ -24,6 +24,25 @@ export function validateRuntimeScope(
   let match: RegExpMatchArray | null;
   // Match the whole path. The SDK accepts suffix matches, so accepting arbitrary
   // prefixes here would validate a different thread than the SDK dispatches.
+  if (path === '' || path === '/') {
+    if (
+      request.method === 'POST' &&
+      data.method === 'resource/request' &&
+      typeof (data.params as any)?.path === 'string'
+    ) {
+      const subPath = String((data.params as any).path);
+      const subMethod = String((data.params as any).httpMethod || 'GET').toUpperCase();
+      const subUrl = new URL(
+        `http://localhost/api/copilotkit${subPath.startsWith('/') ? '' : '/'}${subPath}`,
+      );
+      return validateRuntimeScope(
+        new Request(subUrl, { method: subMethod }),
+        workspace,
+        (data as any).body ?? null,
+      );
+    }
+    return deny();
+  }
   if (path === 'info' || path === 'threads') methods = ['GET'];
   else if (path === 'threads/subscribe') methods = ['POST'];
   else if ((match = path.match(/^agent\/([^/]+)\/(run|connect|suggest)$/))) {
@@ -55,7 +74,7 @@ export function validateRuntimeScope(
     )
       return deny();
     threadId = id(match[1]);
-    methods = ['PATCH', 'DELETE'];
+    methods = ['GET', 'PATCH', 'DELETE'];
   } else return deny();
   if (!methods.includes(request.method)) return deny();
   const resolveDotId = (candidate: string): string | undefined => {
