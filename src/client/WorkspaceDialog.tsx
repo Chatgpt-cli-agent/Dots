@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 import type { Dot, Memory, State, WorkspaceState } from '../shared/types';
 import { ConnectionsSection } from './ConnectionsSection';
+import { PluginsSection } from './PluginsSection';
 import {
   setThemePreference,
   themePreference,
@@ -181,10 +182,16 @@ export function WorkspaceDialog({
                   .filter(Boolean),
                 learningContainerId: learningContainer.trim() || null,
                 skillDeliveryEnabled: skillDelivery,
-                ...(modelEndpoint.trim() ? { modelEndpoint: modelEndpoint.trim() } : {}),
+                ...(modelEndpoint.trim()
+                  ? { modelEndpoint: modelEndpoint.trim() }
+                  : {}),
                 ...(modelId.trim() ? { modelId: modelId.trim() } : {}),
-                ...(contextLimit.trim() ? { contextLimit: Number(contextLimit.trim()) } : {}),
-                ...(maxCompletionTokens.trim() ? { maxCompletionTokens: Number(maxCompletionTokens.trim()) } : {}),
+                ...(contextLimit.trim()
+                  ? { contextLimit: Number(contextLimit.trim()) }
+                  : {}),
+                ...(maxCompletionTokens.trim()
+                  ? { maxCompletionTokens: Number(maxCompletionTokens.trim()) }
+                  : {}),
                 ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
               };
             }
@@ -475,7 +482,11 @@ export function WorkspaceDialog({
                 id="dot-api-key"
                 type="password"
                 value={apiKey}
-                placeholder={dialog.dot?.hasApiKey ? '••••••••' : 'Optional for local models'}
+                placeholder={
+                  dialog.dot?.hasApiKey
+                    ? '••••••••'
+                    : 'Optional for local models'
+                }
                 onChange={(e) => setApiKey(e.target.value)}
               />
             </fieldset>
@@ -504,6 +515,13 @@ export function WorkspaceDialog({
                 completed work before retrying an interrupted run.
               </p>
             </>
+          )}
+          {(dialog.type === 'settings' ||
+            (dialog.type === 'dot' && dialog.dot)) && (
+            <PluginsSection
+              dots={workspace.dots}
+              dotId={dialog.type === 'dot' ? dialog.dot?.id : undefined}
+            />
           )}
           {dialog.type === 'settings' && (
             <fieldset className="appearance-fields">

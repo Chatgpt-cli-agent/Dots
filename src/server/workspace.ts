@@ -7,6 +7,7 @@ import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { validateLearningSettings } from '../shared/learning.js';
 import { globalRunCoordinator } from './run-coordinator.js';
+import { PluginStore } from './plugin-store.js';
 import type {
   CallReceipt,
   Conversation,
@@ -102,6 +103,8 @@ export function formatMessageForAGUI(m: {
 }
 export class WorkspaceStore {
   private db: DatabaseSync;
+  readonly plugins: PluginStore;
+  readonly pluginDirectory: string;
   readonly pages: Pages;
   readonly computers: ComputerStore;
   readonly connections: ConnectionStore;
@@ -111,6 +114,8 @@ export class WorkspaceStore {
   ) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
+    this.pluginDirectory = `${dirname(path)}/plugins`;
+    this.plugins = new PluginStore(this.db);
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS spaces(id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, createdAt INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS dots(id TEXT PRIMARY KEY, spaceId TEXT NOT NULL, name TEXT NOT NULL, instructions TEXT NOT NULL, researchAllowed INTEGER NOT NULL, memoryAllowed INTEGER NOT NULL, createdAt INTEGER NOT NULL);

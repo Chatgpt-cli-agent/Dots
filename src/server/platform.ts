@@ -1,4 +1,5 @@
 import { ComputerService } from './computer-service.js';
+import { PluginService } from './plugin-service.js';
 import { ConnectionService } from './connections.js';
 import { PageService } from './page-service.js';
 import { randomUUID } from 'node:crypto';
@@ -30,6 +31,7 @@ import { validateRuntimeScope } from './runtime-scope.js';
 import { learningSelector } from './learning.js';
 import { SetupTelemetry } from './setup-telemetry.js';
 export class Platform {
+  readonly plugins: PluginService;
   private channelStartupFailed = false;
   readonly setupTelemetry: SetupTelemetry;
   readonly pages: PageService;
@@ -49,6 +51,10 @@ export class Platform {
     readonly config: PlatformConfig,
   ) {
     this.setupTelemetry = new SetupTelemetry(store);
+    this.plugins = new PluginService(
+      workspace.plugins,
+      config.pluginDirectory ?? workspace.pluginDirectory,
+    );
     this.computers = new ComputerService(
       workspace,
       config,

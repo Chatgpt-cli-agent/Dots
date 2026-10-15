@@ -130,6 +130,10 @@ https://github.com/user-attachments/assets/27d03a6c-a9e0-4c29-8d96-fafe0fbae20f
 
 Bring your agents into Slack with [Channels SDK](https://github.com/CopilotKit/channels-sdk). See the [managed Channels documentation](https://docs.copilotkit.ai/intelligence/channels) to connect them through CopilotKit Intelligence.
 
+### Local plugins
+
+Install skill and reference-file packages from **Settings → Plugins**, then assign them to your Dots. Standalone skills remain available. This first release supports local folders with a `plugin.json` or `.codex-plugin/plugin.json` manifest; packaged tool services are not supported yet. See [local plugin setup](docs/PLUGINS.md) and the [Sims Architect example](examples/plugins/sims-architect).
+
 ## Architecture
 
 ### AG-UI connects the agent to the interface

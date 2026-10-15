@@ -4280,3 +4280,36 @@ h3 {
   overflow-wrap: anywhere;
   font-size: 11px;
 }
+/* Local plugin library */
+.plugin-library {
+  min-width: 0;
+  border: 0;
+  margin: 1rem 0;
+  padding: 0;
+}
+.plugin-library legend {
+  font-weight: 600;
+}
+.plugin-card label {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.plugin-library input[type='checkbox'] {
+  width: auto;
+  margin: 0;
+  flex: 0 0 auto;
+}
+.plugin-install {
+  display: grid;
+  gap: 0.6rem;
+}
+.plugin-card {
+  border-top: 1px solid var(--line);
+  padding: 1rem 0;
+  overflow-wrap: anywhere;
+}
+.plugin-assignment {
+  display: block;
+  margin: 0.6rem 0;
+}

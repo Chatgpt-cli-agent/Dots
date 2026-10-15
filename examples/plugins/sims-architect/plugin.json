@@ -1,0 +1,6 @@
+{
+  "name": "sims-architect",
+  "version": "0.1.0",
+  "description": "An example skill package for planning Sims builds. Add your own engineering skills alongside it.",
+  "skills": "./skills/"
+}

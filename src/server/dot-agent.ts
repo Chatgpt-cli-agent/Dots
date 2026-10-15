@@ -28,6 +28,7 @@ import { randomUUID } from 'node:crypto';
 import { Observable, lastValueFrom, toArray, tap } from 'rxjs';
 import { globalRunCoordinator } from './run-coordinator.js';
 import { ProtocolAccumulator } from './protocol-accumulator.js';
+import { PluginService } from './plugin-service.js';
 import { z } from 'zod';
 import { Store } from './store.js';
 import { WorkspaceStore } from './workspace.js';
@@ -208,6 +209,11 @@ export class DotAgent extends AbstractAgent {
           throw new Error('Model configuration is required.');
         }
         const initialSettings = this.store.settings();
+        const plugins = new PluginService(
+          this.workspace.plugins,
+          this.config.pluginDirectory ?? this.workspace.pluginDirectory,
+        );
+        const initialPlugins = plugins.fingerprint(dot.id);
         const initialConnections = this.workspace.connections.fingerprint(
           dot.id,
         );
@@ -216,6 +222,7 @@ export class DotAgent extends AbstractAgent {
           const current = this.workspace.dot(dot.id);
           if (
             settings.paused ||
+            plugins.fingerprint(dot.id) !== initialPlugins ||
             !current ||
             settings.researchAllowed !== initialSettings.researchAllowed ||
             settings.memoryAllowed !== initialSettings.memoryAllowed ||
@@ -605,7 +612,7 @@ export class DotAgent extends AbstractAgent {
           const serverTools = [
             ...tools,
             delegationTool,
-            ...skillsTools(check),
+            ...skillsTools(check, () => plugins.skills(dot.id)),
             ...appTools,
             ...pageTools(pages),
             ...(computer.configured
@@ -688,7 +695,9 @@ Use search_web for web research, list_skills and read_skill for GalaxyOne engine
                   ? lastUserMessage
                   : JSON.stringify(lastUserMessage);
               capturedUserText = userText;
-              const autoSkills = matchAndLoadRelevantSkills(userText, 1);
+              const autoSkills = matchAndLoadRelevantSkills(
+                userText, 1, plugins.skills(dot.id),
+              );
               return chat({
                 adapter,
                 messages: converted.messages,

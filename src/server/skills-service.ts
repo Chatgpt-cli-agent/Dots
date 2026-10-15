@@ -24,48 +24,64 @@ export const SKILLS_ROOT = getSkillsRoot();
 export interface SkillInfo {
   name: string;
   description: string;
+  directory?: string;
 }
 
-let cachedSkills: SkillInfo[] | null = null;
-
-export function getAvailableSkills(): SkillInfo[] {
-  if (cachedSkills) return cachedSkills;
+export function getAvailableSkills(additional: SkillInfo[] = []): SkillInfo[] {
   try {
     const root = getSkillsRoot();
-    if (!fs.existsSync(root)) return [];
+    if (!fs.existsSync(root)) return additional;
     const entries = fs.readdirSync(root, { withFileTypes: true });
     const skills: SkillInfo[] = [];
     for (const entry of entries) {
       if (entry.isDirectory() && !entry.name.startsWith('.')) {
         const skillMd = path.join(root, entry.name, 'SKILL.md');
+        if (!fs.existsSync(skillMd)) continue;
         let description = '';
         if (fs.existsSync(skillMd)) {
           const content = fs.readFileSync(skillMd, 'utf-8');
           const match = content.match(/description:\s*([^\n\r]+)/i);
           if (match) description = match[1].trim();
         }
-        skills.push({ name: entry.name, description });
+        skills.push({
+          name: entry.name,
+          description,
+          directory: path.join(root, entry.name),
+        });
       }
     }
-    cachedSkills = skills;
-    return skills;
+    return [...skills, ...additional];
   } catch {
-    return [];
+    return additional;
   }
 }
 
 export function readSkillContent(
   skillName: string,
   relativePath = 'SKILL.md',
+  additional: SkillInfo[] = [],
 ): string {
   try {
-    const cleanName = path.basename(skillName);
-    const targetFile = relativePath
-      ? relativePath.replace(/^(\/|\\)+/, '')
-      : 'SKILL.md';
-    const fullPath = path.join(getSkillsRoot(), cleanName, targetFile);
+    const skill = getAvailableSkills(additional).find(
+      (s) => s.name === skillName,
+    );
+    if (!skill?.directory) return `Skill not available: ${skillName}`;
+    if (
+      path.isAbsolute(relativePath) ||
+      relativePath.split(/[\\/]/).includes('..')
+    )
+      return 'Skill file must stay inside its skill folder.';
+    const root = fs.realpathSync(skill.directory);
+    const fullPath = fs.realpathSync(
+      path.resolve(root, relativePath || 'SKILL.md'),
+    );
+    const relative = path.relative(root, fullPath);
+    if (relative.startsWith('..') || path.isAbsolute(relative))
+      return 'Skill file must stay inside its skill folder.';
+    if (fs.statSync(fullPath).size > 5_000_000)
+      return 'Skill file exceeds the size limit.';
     if (!fs.existsSync(fullPath)) {
-      return `Skill file not found: ${cleanName}/${targetFile}`;
+      return `Skill file not found: ${skillName}/${relativePath}`;
     }
     return fs.readFileSync(fullPath, 'utf-8');
   } catch (err: any) {
@@ -77,8 +93,12 @@ export function readSkillContent(
  * Autonomously selects the most relevant skills based on user prompt and domain keywords.
  * Returns the full instructions of the top matched skills to inject directly into context.
  */
-export function matchAndLoadRelevantSkills(userText: string, maxSkills = 2): string {
-  const all = getAvailableSkills();
+export function matchAndLoadRelevantSkills(
+  userText: string,
+  maxSkills = 2,
+  additional: SkillInfo[] = [],
+): string {
+  const all = getAvailableSkills(additional);
   if (!all.length) return '';
 
   const q = (userText || '').toLowerCase();
@@ -93,15 +113,37 @@ export function matchAndLoadRelevantSkills(userText: string, maxSkills = 2): str
       if (n.includes(w)) score += 5;
       if (d.includes(w)) score += 2;
     }
-    if (q.includes('sims') && (n.includes('sims') || d.includes('sims'))) score += 10;
-    if (q.includes('mod') && (n.includes('mod') || d.includes('mod'))) score += 6;
-    if (q.includes('reverse') && (n.includes('reverse') || d.includes('reverse'))) score += 12;
-    if (q.includes('protobuf') && (n.includes('reverse') || n.includes('sims4') || n.includes('architecture'))) score += 8;
-    if (q.includes('tuning') && (n.includes('tuning') || d.includes('tuning'))) score += 10;
-    if (q.includes('script') && (n.includes('script') || d.includes('script') || n.includes('ts4'))) score += 10;
-    if (q.includes('package') && (n.includes('package') || d.includes('package'))) score += 8;
+    if (q.includes('sims') && (n.includes('sims') || d.includes('sims')))
+      score += 10;
+    if (q.includes('mod') && (n.includes('mod') || d.includes('mod')))
+      score += 6;
+    if (
+      q.includes('reverse') &&
+      (n.includes('reverse') || d.includes('reverse'))
+    )
+      score += 12;
+    if (
+      q.includes('protobuf') &&
+      (n.includes('reverse') ||
+        n.includes('sims4') ||
+        n.includes('architecture'))
+    )
+      score += 8;
+    if (q.includes('tuning') && (n.includes('tuning') || d.includes('tuning')))
+      score += 10;
+    if (
+      q.includes('script') &&
+      (n.includes('script') || d.includes('script') || n.includes('ts4'))
+    )
+      score += 10;
+    if (
+      q.includes('package') &&
+      (n.includes('package') || d.includes('package'))
+    )
+      score += 8;
     if (q.includes('crash') || q.includes('bug') || q.includes('diagnos')) {
-      if (n.includes('diagnos') || d.includes('diagnos') || n.includes('bug')) score += 8;
+      if (n.includes('diagnos') || d.includes('diagnos') || n.includes('bug'))
+        score += 8;
     }
 
     // Default boost for core Sims 4 skills if Sims is mentioned anywhere
@@ -114,12 +156,12 @@ export function matchAndLoadRelevantSkills(userText: string, maxSkills = 2): str
   const top = scored
     .filter((s) => s.score > 4)
     .sort((a, b) => b.score - a.score)
-    .slice(0, 1);
+    .slice(0, maxSkills);
 
   if (!top.length) return '';
 
   const blocks = top.map((s) => {
-    const content = readSkillContent(s.name, 'SKILL.md');
+    const content = readSkillContent(s.name, 'SKILL.md', additional);
     return `### ACTIVATED SKILL: ${s.name}\n${content.slice(0, 2500)}\n`;
   });
 
@@ -129,21 +171,30 @@ export function matchAndLoadRelevantSkills(userText: string, maxSkills = 2): str
 export function getCompactSkillCatalog(): string {
   const all = getAvailableSkills();
   if (!all.length) return '';
-  const lines = all.map((s) => `- **${s.name}**: ${s.description.slice(0, 100)}`);
+  const lines = all.map(
+    (s) => `- **${s.name}**: ${s.description.slice(0, 100)}`,
+  );
   return `\n\n### FULL PROJECT SKILL CATALOG (${all.length} Skills Available):\n${lines.join('\n')}\nUse read_skill(skill_name) if you need additional specialized guidelines during execution.`;
 }
 
-export function skillsTools(check: () => void) {
+export function skillsTools(
+  check: () => void,
+  additional: () => SkillInfo[] = () => [],
+) {
   return [
     defineTool({
       name: 'list_skills',
-      description: 'List all local engineering and Sims 4 reverse-engineering skills available in GalaxyOne.',
+      description:
+        'List standalone skills and enabled plugin skills assigned to this Dot.',
       parameters: z.object({
-        filter: z.string().optional().describe('Keyword to filter skill names, e.g. "sims" or "reverse"'),
+        filter: z
+          .string()
+          .optional()
+          .describe('Keyword to filter skill names, e.g. "sims" or "reverse"'),
       }),
       execute: async ({ filter }) => {
         check();
-        const all = getAvailableSkills();
+        const all = getAvailableSkills(additional());
         const kw = (filter || '').toLowerCase();
         const filtered = kw
           ? all.filter(
@@ -168,7 +219,9 @@ export function skillsTools(check: () => void) {
       parameters: z.object({
         skill_name: z
           .string()
-          .describe('Name of the skill to read, e.g. "sims4-mod-reverse-engineering"'),
+          .describe(
+            'Name of the skill to read, e.g. "sims4-mod-reverse-engineering"',
+          ),
         file: z
           .string()
           .optional()
@@ -176,7 +229,7 @@ export function skillsTools(check: () => void) {
       }),
       execute: async ({ skill_name, file }) => {
         check();
-        const content = readSkillContent(skill_name, file);
+        const content = readSkillContent(skill_name, file, additional());
         return {
           skill: skill_name,
           content: content.slice(0, 16000),
