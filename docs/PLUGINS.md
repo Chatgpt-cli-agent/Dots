@@ -2,6 +2,8 @@
 
 Dots can install local packages of skills and reference files. Existing standalone skills continue to work through the configured skills directory. A plugin does not change the model or grant new computer or connected-service permissions.
 
+The restored standalone library lives in the repository's `skills/` folder and is the default. `SKILLS_PATH`, `SKILLS_DIR`, or `OPENDOTS_SKILLS_PATH` can select another directory. The legacy `GALAXYONE_SKILLS_PATH` setting is still accepted as an explicit override; you do not need GalaxyOne to use the bundled library. Dots does not move or delete the standalone directory during plugin operations. Skill packages' own tests remain resources; the Dots test runner discovers application tests under `tests/` only.
+
 Open **Settings → Plugins**, enter the package folder path on the Dots server, and choose **Install plugin**. Assign it to the Dots that should use it. Assignments and enable/disable changes save immediately. You can also change an existing Dot's assignments in its settings. New installations are enabled but assigned to no Dots.
 
 Try the included `examples/plugins/sims-architect` directory. Installation copies the package into the managed library beside the workspace database (`data/plugins` by default). Changes to the source folder do not affect installed packages. `DOTS_PLUGIN_DIR` can override that location. Keep the library and SQLite database together when backing up or moving the server.

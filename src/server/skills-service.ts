@@ -11,10 +11,10 @@ export function getSkillsRoot(): string {
   if (process.env.GALAXYONE_SKILLS_PATH)
     return process.env.GALAXYONE_SKILLS_PATH;
   const standardPaths = [
-    path.resolve(process.cwd(), 'skills'),
+    // Source checkout and compiled server layouts both resolve to Dots' library.
     fileURLToPath(new URL('../../skills', import.meta.url)),
-    'C:\\Users\\jmoor\\Projects\\GalaxyOne\\skills',
-    path.resolve(process.cwd(), '../GalaxyOne/skills'),
+    fileURLToPath(new URL('../../../skills', import.meta.url)),
+    path.resolve(process.cwd(), 'skills'),
   ];
   for (const p of standardPaths) {
     if (fs.existsSync(p)) return p;

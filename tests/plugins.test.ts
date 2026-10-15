@@ -16,6 +16,7 @@ import { Platform } from '../src/server/platform.js';
 import { PluginService } from '../src/server/plugin-service.js';
 import { pluginRoutes } from '../src/server/plugin-routes.js';
 import {
+  getSkillsRoot,
   getAvailableSkills,
   readSkillContent,
   skillsTools,
@@ -31,6 +32,20 @@ afterEach(() => {
     .splice(0)
     .forEach((fn) => fn());
   vi.unstubAllEnvs();
+});
+
+it('prefers the restored Dots skills folder when no explicit root is configured', () => {
+  for (const name of [
+    'SKILLS_PATH',
+    'SKILLS_DIR',
+    'OPENDOTS_SKILLS_PATH',
+    'GALAXYONE_SKILLS_PATH',
+  ])
+    vi.stubEnv(name, '');
+  expect(getSkillsRoot()).toBe(path.resolve(process.cwd(), 'skills'));
+  expect(getAvailableSkills().some((skill) => skill.name === 'sims-4')).toBe(
+    true,
+  );
 });
 function fixture() {
   const root = mkdtempSync(path.join(tmpdir(), 'dots-plugin-'));
