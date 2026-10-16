@@ -9,6 +9,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
@@ -25,23 +26,31 @@ import type { ConnectionService } from './connections.js';
 
 export class PluginError extends Error {}
 
-export function computePackageFingerprint(
-  manifest: { name: string; version: string; description: string; skills?: any },
-  services: PluginServiceDeclaration[],
-  skills: InstalledPlugin['skills'],
-): string {
-  const payload = JSON.stringify({
-    name: manifest.name,
-    version: manifest.version,
-    description: manifest.description,
-    skills: skills.map((s) => ({ name: s.name, directory: s.directory })),
-    services: services.map((s) => ({
-      name: s.name,
-      url: s.url,
-      requiresToken: s.requiresToken,
-    })),
-  });
-  return createHash('sha256').update(payload).digest('hex');
+export function computePackageFingerprint(dir: string): string {
+  if (!existsSync(dir)) return '';
+  const fileEntries: { relPath: string; hash: string }[] = [];
+  const walk = (currentDir: string) => {
+    const names = readdirSync(currentDir).sort();
+    for (const name of names) {
+      const fullPath = path.join(currentDir, name);
+      const stat = lstatSync(fullPath);
+      if (stat.isDirectory()) {
+        walk(fullPath);
+      } else if (stat.isFile()) {
+        const relPath = path.relative(dir, fullPath).split(path.sep).join('/');
+        const content = readFileSync(fullPath);
+        const fileHash = createHash('sha256').update(content).digest('hex');
+        fileEntries.push({ relPath, hash: fileHash });
+      }
+    }
+  };
+  walk(dir);
+  fileEntries.sort((a, b) => a.relPath.localeCompare(b.relPath));
+  const hasher = createHash('sha256');
+  for (const entry of fileEntries) {
+    hasher.update(`${entry.relPath}:${entry.hash}\n`);
+  }
+  return hasher.digest('hex');
 }
 
 const manifestSchema = z
@@ -243,14 +252,59 @@ export class PluginService {
       const rootPath = path.resolve(this.root);
       if (!existsSync(rootPath)) return;
       const entries = readdirSync(rootPath, { withFileTypes: true });
+
+      // Clean up any lingering staging directories
       for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
-        if (entry.name.startsWith('staging-')) {
+        if (entry.isDirectory() && entry.name.startsWith('staging-')) {
           rmSync(path.join(rootPath, entry.name), {
             recursive: true,
             force: true,
           });
-        } else if (entry.name.startsWith('backup-')) {
+        }
+      }
+
+      // Recover or finalize from any update journals
+      for (const entry of entries) {
+        if (
+          entry.isFile() &&
+          entry.name.startsWith('journal-') &&
+          entry.name.endsWith('.json')
+        ) {
+          const pluginId = entry.name.slice('journal-'.length, -'.json'.length);
+          const journalPath = path.join(rootPath, entry.name);
+          const backupDir = path.join(rootPath, `backup-${pluginId}`);
+          const destDir = path.join(rootPath, pluginId);
+          try {
+            const journal = JSON.parse(readFileSync(journalPath, 'utf8'));
+            const dbPlugin = this.store.list().find((p) => p.id === pluginId);
+            if (
+              dbPlugin &&
+              dbPlugin.packageFingerprint &&
+              dbPlugin.packageFingerprint === journal.toFingerprint
+            ) {
+              // Update successfully committed to database
+              if (existsSync(backupDir)) {
+                rmSync(backupDir, { recursive: true, force: true });
+              }
+            } else {
+              // Update was not committed to database; rollback to backup
+              if (existsSync(destDir)) {
+                rmSync(destDir, { recursive: true, force: true });
+              }
+              if (existsSync(backupDir)) {
+                renameSync(backupDir, destDir);
+              }
+            }
+          } catch {}
+          if (existsSync(journalPath)) {
+            rmSync(journalPath, { force: true });
+          }
+        }
+      }
+
+      // Recover any remaining backup directories
+      for (const entry of entries) {
+        if (entry.isDirectory() && entry.name.startsWith('backup-')) {
           const pluginId = entry.name.replace(/^backup-/, '');
           const backupDir = path.join(rootPath, entry.name);
           const destDir = path.join(rootPath, pluginId);
@@ -263,16 +317,12 @@ export class PluginService {
             renameSync(backupDir, destDir);
             continue;
           }
+
           let destMatches = false;
           try {
-            const manifestPath = existsSync(
-              path.join(destDir, '.codex-plugin', 'plugin.json'),
-            )
-              ? path.join(destDir, '.codex-plugin', 'plugin.json')
-              : path.join(destDir, 'plugin.json');
-            if (existsSync(manifestPath)) {
-              const parsed = JSON.parse(readFileSync(manifestPath, 'utf8'));
-              if (parsed.version === dbPlugin.version) {
+            if (dbPlugin.packageFingerprint) {
+              const destFingerprint = computePackageFingerprint(destDir);
+              if (destFingerprint === dbPlugin.packageFingerprint) {
                 destMatches = true;
               }
             }
@@ -411,11 +461,7 @@ export class PluginService {
       }
     }
 
-    const packageFingerprint = computePackageFingerprint(
-      manifest,
-      services,
-      skills,
-    );
+    const packageFingerprint = computePackageFingerprint(sourceRoot);
 
     return {
       name: manifest.name,
@@ -481,6 +527,7 @@ export class PluginService {
         throw new PluginError(
           'Plugin must declare at least one skill or MCP service.',
         );
+      const packageFingerprint = computePackageFingerprint(staging);
       const plugin: InstalledPlugin = {
         id: path.basename(staging),
         name: manifest.name,
@@ -491,6 +538,7 @@ export class PluginService {
         skills,
         dotIds: [],
         services: [],
+        packageFingerprint,
       };
       this.store.addPluginWithServices(plugin, services);
       return this.require(plugin.id);
@@ -512,6 +560,7 @@ export class PluginService {
     const staging = this.folder(`staging-${randomUUID()}`);
     const backup = this.folder(`backup-${existing.id}`);
     const dest = this.folder(existing.id);
+    const journalPath = path.join(this.root, `journal-${existing.id}.json`);
     let swapped = false;
     try {
       const sourceRoot = realpathSync(source);
@@ -566,16 +615,28 @@ export class PluginService {
           `Package version changed from ${options.expectedVersion} to ${manifest.version} since preview.`,
         );
       }
+      const stagingFingerprint = computePackageFingerprint(staging);
       if (options?.expectedFingerprint) {
-        const fingerprint = computePackageFingerprint(
-          manifest,
-          services,
-          skills,
-        );
-        if (fingerprint !== options.expectedFingerprint) {
+        if (stagingFingerprint !== options.expectedFingerprint) {
           throw new PluginError('Package contents changed since preview.');
         }
       }
+
+      const fromFingerprint =
+        existing.packageFingerprint ??
+        (existsSync(dest) ? computePackageFingerprint(dest) : '');
+      const toFingerprint = stagingFingerprint;
+
+      writeFileSync(
+        journalPath,
+        JSON.stringify({
+          pluginId: existing.id,
+          stage: 'swapping',
+          fromFingerprint,
+          toFingerprint,
+          timestamp: Date.now(),
+        }),
+      );
 
       if (existsSync(backup)) {
         rmSync(backup, { recursive: true, force: true });
@@ -595,12 +656,16 @@ export class PluginService {
           description: manifest.description,
           installedAt: existing.installedAt,
           skills,
+          packageFingerprint: toFingerprint,
         },
         services,
       );
 
       if (existsSync(backup)) {
         rmSync(backup, { recursive: true, force: true });
+      }
+      if (existsSync(journalPath)) {
+        rmSync(journalPath, { force: true });
       }
 
       return this.require(existing.id);
@@ -614,6 +679,9 @@ export class PluginService {
         }
       } else if (existsSync(backup) && !existsSync(dest)) {
         renameSync(backup, dest);
+      }
+      if (existsSync(journalPath)) {
+        rmSync(journalPath, { force: true });
       }
       if (existsSync(staging)) {
         rmSync(staging, { recursive: true, force: true });

@@ -803,19 +803,25 @@ it('Scenario 11: Update confirmation bound to previewed version and package fing
       api: { url: 'http://localhost:8080/mcp', requiresToken: false },
     },
   });
+  // Add a reference file
+  mkdirSync(path.join(updateDir, 'skills', 'helper', 'references'), { recursive: true });
+  writeFileSync(
+    path.join(updateDir, 'skills', 'helper', 'references', 'guide.md'),
+    'Reference guide content v1',
+  );
 
   const previewRes = await h.pluginRequest('/plugins/preview', 'POST', { path: updateDir });
   const preview = await previewRes.json();
   expect(preview.packageFingerprint).toBeDefined();
 
-  // Mismatched expectedVersion
+  // 1. Mismatched expectedVersion
   const badVerRes = await h.pluginRequest(`/plugins/${p.id}/update`, 'POST', {
     path: updateDir,
     expectedVersion: '1.0.9',
   });
   expect(badVerRes.status).toBe(400);
 
-  // Mismatched expectedFingerprint
+  // 2. Mismatched expectedFingerprint
   const badFpRes = await h.pluginRequest(`/plugins/${p.id}/update`, 'POST', {
     path: updateDir,
     expectedVersion: '1.1.0',
@@ -823,11 +829,45 @@ it('Scenario 11: Update confirmation bound to previewed version and package fing
   });
   expect(badFpRes.status).toBe(400);
 
-  // Matching expectedVersion & fingerprint succeeds
-  const goodRes = await h.pluginRequest(`/plugins/${p.id}/update`, 'POST', {
+  // 3. Modifying ONLY SKILL.md without changing manifest version invalidates preview fingerprint
+  writeFileSync(
+    path.join(updateDir, 'skills', 'helper', 'SKILL.md'),
+    '---\nname: helper\ndescription: A helpful skill\n---\nTampered instructions',
+  );
+  const tamperedSkillRes = await h.pluginRequest(`/plugins/${p.id}/update`, 'POST', {
     path: updateDir,
     expectedVersion: preview.version,
     expectedFingerprint: preview.packageFingerprint,
+  });
+  expect(tamperedSkillRes.status).toBe(400);
+  const tamperedSkillJson = await tamperedSkillRes.json();
+  expect(tamperedSkillJson.error).toContain('Package contents changed since preview');
+
+  // 4. Modifying ONLY a reference file invalidates preview fingerprint
+  const preview2Res = await h.pluginRequest('/plugins/preview', 'POST', { path: updateDir });
+  const preview2 = await preview2Res.json();
+  expect(preview2.packageFingerprint).not.toBe(preview.packageFingerprint);
+
+  writeFileSync(
+    path.join(updateDir, 'skills', 'helper', 'references', 'guide.md'),
+    'Tampered reference guide content',
+  );
+  const tamperedRefRes = await h.pluginRequest(`/plugins/${p.id}/update`, 'POST', {
+    path: updateDir,
+    expectedVersion: preview2.version,
+    expectedFingerprint: preview2.packageFingerprint,
+  });
+  expect(tamperedRefRes.status).toBe(400);
+  const tamperedRefJson = await tamperedRefRes.json();
+  expect(tamperedRefJson.error).toContain('Package contents changed since preview');
+
+  // 5. Re-previewing the latest content and confirming matching fingerprint succeeds
+  const preview3Res = await h.pluginRequest('/plugins/preview', 'POST', { path: updateDir });
+  const preview3 = await preview3Res.json();
+  const goodRes = await h.pluginRequest(`/plugins/${p.id}/update`, 'POST', {
+    path: updateDir,
+    expectedVersion: preview3.version,
+    expectedFingerprint: preview3.packageFingerprint,
   });
   expect(goodRes.status).toBe(200);
 });
@@ -900,7 +940,7 @@ it('Scenario 12: Atomic rollback on failure injection during update and initial 
   expect(h.platform.plugins.list().some((item) => item.name === 'install-fail-pack')).toBe(false);
 });
 
-it('Scenario 13: Interrupted update recovery on restart via recoverStaleState', async () => {
+it('Scenario 13: Interrupted update recovery on restart via recoverStaleState, including same-version replacement', async () => {
   const h = createTestHarness();
   const pDir = h.createPluginFolder('interrupted-pack', {
     version: '1.0.0',
@@ -911,7 +951,7 @@ it('Scenario 13: Interrupted update recovery on restart via recoverStaleState', 
   const destDir = path.join(pluginRoot, p.id);
   const backupDir = path.join(pluginRoot, `backup-${p.id}`);
 
-  // Simulate an interrupted update where DB did not commit:
+  // Test Case A: Interrupted update where DB did not commit (version 2.0.0):
   // 1. dest has v2.0.0 files
   // 2. backup has v1.0.0 files
   // 3. DB still has v1.0.0
@@ -921,17 +961,46 @@ it('Scenario 13: Interrupted update recovery on restart via recoverStaleState', 
     path.join(destDir, 'plugin.json'),
     JSON.stringify({ name: 'interrupted-pack', version: '2.0.0', description: 'v2' }),
   );
+  mkdirSync(path.join(destDir, 'skills', 'helper'), { recursive: true });
+  writeFileSync(
+    path.join(destDir, 'skills', 'helper', 'SKILL.md'),
+    'v2 uncommitted skill text',
+  );
 
   // Create new PluginService instance (simulating restart)
   new PluginService(h.workspace.plugins, pluginRoot);
   // Dest should have been restored from backup (v1.0.0)
   const restoredManifest = JSON.parse(readFileSync(path.join(destDir, 'plugin.json'), 'utf8'));
   expect(restoredManifest.version).toBe('1.0.0');
+  const restoredSkill = readFileSync(path.join(destDir, 'skills', 'helper', 'SKILL.md'), 'utf8');
+  expect(restoredSkill).toContain('Help instructions');
   // Backup folder should be gone
   expect(existsSync(backupDir)).toBe(false);
 
-  // Now simulate interrupted update where DB did commit but backup folder wasn't deleted:
-  // DB has v1.0.0, dest has v1.0.0, stale backup exists
+  // Test Case B: SAME-VERSION interrupted update before DB commit:
+  // Both old and new files use version "1.0.0", but dest has uncommitted changes
+  renameSync(destDir, backupDir);
+  mkdirSync(destDir, { recursive: true });
+  writeFileSync(
+    path.join(destDir, 'plugin.json'),
+    JSON.stringify({ name: 'interrupted-pack', version: '1.0.0', description: 'v1 modified' }),
+  );
+  mkdirSync(path.join(destDir, 'skills', 'helper'), { recursive: true });
+  writeFileSync(
+    path.join(destDir, 'skills', 'helper', 'SKILL.md'),
+    'Uncommitted same-version skill text',
+  );
+
+  // Restart PluginService
+  new PluginService(h.workspace.plugins, pluginRoot);
+  // Dest must be restored to original committed content, not uncommitted same-version content!
+  const restoredSameVerSkill = readFileSync(path.join(destDir, 'skills', 'helper', 'SKILL.md'), 'utf8');
+  expect(restoredSameVerSkill).toContain('Help instructions');
+  expect(restoredSameVerSkill).not.toContain('Uncommitted');
+  expect(existsSync(backupDir)).toBe(false);
+
+  // Test Case C: Interrupted update where DB did commit but backup folder wasn't deleted:
+  // DB committed current dest content, stale backup exists
   mkdirSync(backupDir, { recursive: true });
   writeFileSync(path.join(backupDir, 'stale.txt'), 'stale');
 

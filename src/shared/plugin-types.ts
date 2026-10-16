@@ -29,6 +29,7 @@ export interface InstalledPlugin {
   skills: { name: string; description: string; directory: string }[];
   dotIds: string[];
   services: InstalledPluginToolService[];
+  packageFingerprint?: string;
 }
 
 export interface PluginPreview {
