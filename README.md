@@ -132,7 +132,7 @@ Bring your agents into Slack with [Channels SDK](https://github.com/CopilotKit/c
 
 ### Local plugins
 
-Install skill and reference-file packages from **Settings → Plugins**, then assign them to your Dots. Standalone skills remain available. This first release supports local folders with a `plugin.json` or `.codex-plugin/plugin.json` manifest; packaged tool services are not supported yet. See [local plugin setup](docs/PLUGINS.md) and the [Sims Architect example](examples/plugins/sims-architect).
+Install skill, reference-file, and packaged MCP tool-service packages from **Settings → Plugins**, then assign them to your Dots. Standalone skills and direct Dot Connections remain available. Packages declare skills and HTTP MCP endpoints with `plugin.json` or `.codex-plugin/plugin.json`. Packaged tool services support bearer authentication, tool discovery, approval policies, credential redaction, and atomic updates with rollback. See [local plugin setup](docs/PLUGINS.md) and the [Sims Architect example](examples/plugins/sims-architect).
 
 ## Architecture
 

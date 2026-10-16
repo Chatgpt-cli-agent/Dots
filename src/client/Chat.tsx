@@ -101,7 +101,8 @@ export function Chat({
   const [runError, setRunError] = useState('');
   const chatError = error || runError;
   const [loaded, setLoaded] = useState(false);
-  const [running, setRunning] = useState(false);
+  const [submitting, setRunning] = useState(false);
+  const running = submitting || agent.isRunning;
   const voice = useVoice(thread.id, onSaved, agent.messages.at(-1)?.id);
   const sent = useRef(false);
   const bottom = useRef<HTMLDivElement>(null);

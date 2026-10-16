@@ -1,12 +1,7 @@
-import { InMemoryAgentRunner, type AgentRunnerRunRequest } from '@copilotkit/runtime/v2';
+import { InMemoryAgentRunner } from '@copilotkit/runtime/v2';
 import { EventType, type BaseEvent } from '@ag-ui/core';
 import { Observable, ReplaySubject } from 'rxjs';
-import { randomUUID } from 'node:crypto';
-import {
-  type WorkspaceStore,
-  type NativeMessage,
-  formatMessageForAGUI,
-} from './workspace.js';
+import { type WorkspaceStore, formatMessageForAGUI } from './workspace.js';
 import { globalRunCoordinator, RunCoordinator } from './run-coordinator.js';
 
 export interface NativeAgentRunnerOptions {
@@ -39,51 +34,14 @@ export class NativeAgentRunner extends InMemoryAgentRunner {
     // 2. Emit MESSAGES_SNAPSHOT event
     connectionSubject.next({
       type: EventType.MESSAGES_SNAPSHOT,
-      messages: messages as any,
-    } as any);
+      messages,
+    });
 
-    // 3. Check for any pending tool approval on this thread
-    const pendingExecutions = this.workspace.getToolExecutions(threadId);
-    const hasToolResultForCall = (callId?: string | null) =>
-      !callId
-        ? false
-        : rawMessages.some(
-            (m) =>
-              m.role === 'tool' &&
-              (m.toolCallId === callId || (m as any).tool_call_id === callId),
-          );
-    const pendingApproval = pendingExecutions.find(
-      (exec) =>
-        exec.status === 'awaiting_approval' &&
-        !exec.approved &&
-        !hasToolResultForCall(exec.toolCallId),
-    );
+    // Pending frontend tools are restored by their saved assistant tool calls.
+    // A standard interrupt requires a separate resume payload; emitting one here
+    // prevents the browser from submitting the tool-result continuation.
 
-    if (pendingApproval) {
-      connectionSubject.next({
-        type: EventType.RUN_FINISHED,
-        threadId,
-        runId: pendingApproval.runId || randomUUID(),
-        outcome: {
-          type: 'interrupt',
-          interrupts: [
-            {
-              id: pendingApproval.id,
-              reason: `Approval required for ${pendingApproval.toolName}`,
-              name: pendingApproval.toolName,
-              toolCallId: pendingApproval.toolCallId ?? undefined,
-              args: pendingApproval.args,
-              metadata: {
-                name: pendingApproval.toolName,
-                args: pendingApproval.args,
-              },
-            },
-          ],
-        },
-      } as any);
-    }
-
-    // 4. If an active run is currently executing on this thread, stream live events
+    // If an active run is currently executing on this thread, stream live events
     const activeRun = this.runCoordinator.getActiveRun(threadId);
     if (activeRun && !activeRun.eventSubject.closed) {
       activeRun.eventSubject.subscribe({
@@ -99,13 +57,21 @@ export class NativeAgentRunner extends InMemoryAgentRunner {
   }
 
   override isRunning(request: { threadId: string }): Promise<boolean> {
-    return Promise.resolve(this.runCoordinator.isThreadActive(request.threadId));
+    return Promise.resolve(
+      this.runCoordinator.isThreadActive(request.threadId),
+    );
   }
 
-  override stop(request: { threadId: string; runId?: string }): Promise<boolean> {
+  override stop(request: {
+    threadId: string;
+    runId?: string;
+  }): Promise<boolean> {
     const cancelled = request.runId
       ? this.runCoordinator.cancelRun(request.runId, 'Stopped via runner')
-      : this.runCoordinator.cancelThread(request.threadId, 'Stopped via runner');
+      : this.runCoordinator.cancelThread(
+          request.threadId,
+          'Stopped via runner',
+        );
     return Promise.resolve(cancelled);
   }
 
@@ -120,7 +86,7 @@ export class NativeAgentRunner extends InMemoryAgentRunner {
     }));
   }
 
-  override getThreadMessages(threadId: string): any[] {
+  override getThreadMessages(threadId: string) {
     return this.workspace.getNativeMessages(threadId).map(formatMessageForAGUI);
   }
 }

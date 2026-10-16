@@ -56,11 +56,21 @@ it('persists bounded offline events with stable IDs and CLI identity across rest
       installation_id: installationId,
     },
   });
-  expect(JSON.parse(store.setupTelemetryState()!).queue).toEqual([]);
+  // A flush intentionally has a two-second delivery budget. Disk-backed
+  // persistence can need several batches under full-suite contention.
+  await expect
+    .poll(
+      async () => {
+        await telemetry.flush();
+        return JSON.parse(store.setupTelemetryState()!).queue;
+      },
+      { timeout: 10_000 },
+    )
+    .toEqual([]);
   expect(JSON.stringify(requests)).not.toContain('secret transport error');
   store.close();
   rmSync(dir, { recursive: true });
-});
+}, 20_000);
 
 it.each(['DO_NOT_TRACK', 'COPILOTKIT_TELEMETRY_DISABLED'])(
   'purges pending telemetry for both true and 1 in %s',

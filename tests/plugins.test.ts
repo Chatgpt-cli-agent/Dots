@@ -164,9 +164,16 @@ it('accepts the Codex manifest location but explicitly rejects unsupported tool 
     path.join(f.source, '.codex-plugin/plugin.json'),
     readFileSync(path.join(f.source, 'plugin.json')),
   );
-  expect(f.service.install(f.source).name).toBe('sims-builder');
-  writeFileSync(path.join(f.source, '.mcp.json'), '{}');
-  expect(() => f.service.install(f.source)).toThrow('Tool servers');
+  const installed = f.service.install(f.source);
+  expect(installed.name).toBe('sims-builder');
+  f.service.uninstall(installed.id);
+  writeFileSync(
+    path.join(f.source, '.mcp.json'),
+    JSON.stringify({ mcpServers: { bad: { command: 'node' } } }),
+  );
+  expect(() => f.service.install(f.source)).toThrow(
+    'Subprocess and command transports are not permitted',
+  );
 });
 
 it('rejects duplicate names, escaping skill paths, and leaves no partial registry entries', () => {

@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { validateLearningSettings } from '../shared/learning.js';
 import { globalRunCoordinator } from './run-coordinator.js';
 import { PluginStore } from './plugin-store.js';
+import { migrateNativeRuns } from './native-run-schema.js';
 import type {
   CallReceipt,
   Conversation,
@@ -114,6 +115,7 @@ export class WorkspaceStore {
   ) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
+    migrateNativeRuns(this.db);
     this.pluginDirectory = `${dirname(path)}/plugins`;
     this.plugins = new PluginStore(this.db);
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
@@ -124,7 +126,7 @@ export class WorkspaceStore {
       CREATE TABLE IF NOT EXISTS calls(id TEXT PRIMARY KEY, threadId TEXT NOT NULL, startedAt INTEGER NOT NULL, endedAt INTEGER, status TEXT NOT NULL, transcript TEXT NOT NULL, error TEXT);
       CREATE TABLE IF NOT EXISTS captures(threadId TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS thread_messages(id TEXT PRIMARY KEY, threadId TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, createdAt INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, threadId TEXT NOT NULL, dotId TEXT NOT NULL, parentRunId TEXT, status TEXT NOT NULL, error TEXT, startedAt INTEGER NOT NULL, finishedAt INTEGER, metadata TEXT);
+      CREATE TABLE IF NOT EXISTS native_runs(id TEXT PRIMARY KEY, threadId TEXT NOT NULL, dotId TEXT NOT NULL, parentRunId TEXT, status TEXT NOT NULL, error TEXT, startedAt INTEGER NOT NULL, finishedAt INTEGER, metadata TEXT);
       CREATE TABLE IF NOT EXISTS tool_executions(id TEXT PRIMARY KEY, runId TEXT NOT NULL, threadId TEXT NOT NULL, toolName TEXT NOT NULL, args TEXT NOT NULL, result TEXT, status TEXT NOT NULL, approvalRequired INTEGER NOT NULL DEFAULT 0, approved INTEGER NOT NULL DEFAULT 0, error TEXT, createdAt INTEGER NOT NULL, finishedAt INTEGER);`);
     for (const [table, column, definition] of [
       ['dots', 'learningContainerId', 'TEXT'],
@@ -757,7 +759,7 @@ export class WorkspaceStore {
       const metadataStr = metadata ? JSON.stringify(metadata) : null;
       this.db
         .prepare(
-          'UPDATE runs SET threadId=?, dotId=?, parentRunId=?, status=?, startedAt=?, metadata=? WHERE id=?',
+          'UPDATE native_runs SET threadId=?, dotId=?, parentRunId=?, status=?, startedAt=?, metadata=? WHERE id=?',
         )
         .run(
           run.threadId,
@@ -786,7 +788,7 @@ export class WorkspaceStore {
     const parentRunId = run.parentRunId ?? null;
     this.db
       .prepare(
-        'INSERT INTO runs (id, threadId, dotId, parentRunId, status, error, startedAt, finishedAt, metadata) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?)',
+        'INSERT INTO native_runs (id, threadId, dotId, parentRunId, status, error, startedAt, finishedAt, metadata) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?)',
       )
       .run(
         id,
@@ -832,7 +834,7 @@ export class WorkspaceStore {
 
     this.db
       .prepare(
-        'UPDATE runs SET status=?, error=?, finishedAt=?, metadata=? WHERE id=?',
+        'UPDATE native_runs SET status=?, error=?, finishedAt=?, metadata=? WHERE id=?',
       )
       .run(status, error ?? null, finishedAt ?? null, metadataStr, id);
 
@@ -847,7 +849,7 @@ export class WorkspaceStore {
 
   getRun(id: string): NativeRun | null {
     const row = this.db
-      .prepare('SELECT * FROM runs WHERE id=?')
+      .prepare('SELECT * FROM native_runs WHERE id=?')
       .get(id) as any;
     if (!row) return null;
     return {
@@ -866,7 +868,7 @@ export class WorkspaceStore {
   getActiveRun(threadId: string): NativeRun | null {
     const row = this.db
       .prepare(
-        "SELECT * FROM runs WHERE threadId=? AND status IN ('queued', 'running') ORDER BY startedAt DESC LIMIT 1",
+        "SELECT * FROM native_runs WHERE threadId=? AND status IN ('queued', 'running') ORDER BY startedAt DESC LIMIT 1",
       )
       .get(threadId) as any;
     if (!row) return null;
@@ -885,7 +887,7 @@ export class WorkspaceStore {
 
   getRuns(threadId: string): NativeRun[] {
     const rows = this.db
-      .prepare('SELECT * FROM runs WHERE threadId=? ORDER BY startedAt DESC')
+      .prepare('SELECT * FROM native_runs WHERE threadId=? ORDER BY startedAt DESC')
       .all(threadId) as any[];
     return rows.map((row) => ({
       id: String(row.id),
@@ -905,13 +907,13 @@ export class WorkspaceStore {
     if (excludeRunId) {
       this.db
         .prepare(
-          "UPDATE runs SET status='cancelled', error=?, finishedAt=? WHERE threadId=? AND status IN ('queued', 'running') AND id != ?",
+          "UPDATE native_runs SET status='cancelled', error=?, finishedAt=? WHERE threadId=? AND status IN ('queued', 'running') AND id != ?",
         )
         .run(error, Date.now(), threadId, excludeRunId);
     } else {
       this.db
         .prepare(
-          "UPDATE runs SET status='cancelled', error=?, finishedAt=? WHERE threadId=? AND status IN ('queued', 'running')",
+          "UPDATE native_runs SET status='cancelled', error=?, finishedAt=? WHERE threadId=? AND status IN ('queued', 'running')",
         )
         .run(error, Date.now(), threadId);
     }
