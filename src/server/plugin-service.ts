@@ -253,7 +253,7 @@ export class PluginService {
       if (!existsSync(rootPath)) return;
       const entries = readdirSync(rootPath, { withFileTypes: true });
 
-      // Clean up any lingering staging directories
+      // Clean up lingering staging directories
       for (const entry of entries) {
         if (entry.isDirectory() && entry.name.startsWith('staging-')) {
           rmSync(path.join(rootPath, entry.name), {
@@ -263,77 +263,113 @@ export class PluginService {
         }
       }
 
-      // Recover or finalize from any update journals
+      // Collect all affected plugin IDs that have a journal or backup
+      const affectedIds = new Set<string>();
       for (const entry of entries) {
         if (
           entry.isFile() &&
           entry.name.startsWith('journal-') &&
           entry.name.endsWith('.json')
         ) {
-          const pluginId = entry.name.slice('journal-'.length, -'.json'.length);
-          const journalPath = path.join(rootPath, entry.name);
-          const backupDir = path.join(rootPath, `backup-${pluginId}`);
-          const destDir = path.join(rootPath, pluginId);
-          try {
-            const journal = JSON.parse(readFileSync(journalPath, 'utf8'));
-            const dbPlugin = this.store.list().find((p) => p.id === pluginId);
-            if (
-              dbPlugin &&
-              dbPlugin.packageFingerprint &&
-              dbPlugin.packageFingerprint === journal.toFingerprint
-            ) {
-              // Update successfully committed to database
-              if (existsSync(backupDir)) {
-                rmSync(backupDir, { recursive: true, force: true });
-              }
-            } else {
-              // Update was not committed to database; rollback to backup
-              if (existsSync(destDir)) {
-                rmSync(destDir, { recursive: true, force: true });
-              }
-              if (existsSync(backupDir)) {
-                renameSync(backupDir, destDir);
-              }
-            }
-          } catch {}
-          if (existsSync(journalPath)) {
-            rmSync(journalPath, { force: true });
-          }
+          affectedIds.add(entry.name.slice('journal-'.length, -'.json'.length));
+        } else if (entry.isDirectory() && entry.name.startsWith('backup-')) {
+          affectedIds.add(entry.name.slice('backup-'.length));
         }
       }
 
-      // Recover any remaining backup directories
-      for (const entry of entries) {
-        if (entry.isDirectory() && entry.name.startsWith('backup-')) {
-          const pluginId = entry.name.replace(/^backup-/, '');
-          const backupDir = path.join(rootPath, entry.name);
-          const destDir = path.join(rootPath, pluginId);
-          const dbPlugin = this.store.list().find((p) => p.id === pluginId);
-          if (!dbPlugin) {
-            rmSync(backupDir, { recursive: true, force: true });
-            continue;
-          }
-          if (!existsSync(destDir)) {
-            renameSync(backupDir, destDir);
-            continue;
-          }
+      for (const pluginId of affectedIds) {
+        const journalPath = path.join(rootPath, `journal-${pluginId}.json`);
+        const backupDir = path.join(rootPath, `backup-${pluginId}`);
+        const destDir = path.join(rootPath, pluginId);
+        const hasJournal = existsSync(journalPath);
+        const hasBackup = existsSync(backupDir);
+        const hasDest = existsSync(destDir);
 
-          let destMatches = false;
+        const dbPlugin = this.store.list().find((p) => p.id === pluginId);
+        if (!dbPlugin) {
+          // Plugin was deleted or uninstalled from DB
+          if (hasBackup) rmSync(backupDir, { recursive: true, force: true });
+          if (hasJournal) rmSync(journalPath, { force: true });
+          continue;
+        }
+
+        let journal: {
+          stage?: string;
+          fromFingerprint?: string;
+          toFingerprint?: string;
+        } | null = null;
+        if (hasJournal) {
           try {
-            if (dbPlugin.packageFingerprint) {
-              const destFingerprint = computePackageFingerprint(destDir);
-              if (destFingerprint === dbPlugin.packageFingerprint) {
-                destMatches = true;
-              }
-            }
-          } catch {}
-
-          if (destMatches) {
-            rmSync(backupDir, { recursive: true, force: true });
-          } else {
-            rmSync(destDir, { recursive: true, force: true });
-            renameSync(backupDir, destDir);
+            journal = JSON.parse(readFileSync(journalPath, 'utf8'));
+          } catch {
+            // Unparseable journal: keep for diagnosis if state is ambiguous
           }
+        }
+
+        const destFingerprint = hasDest ? computePackageFingerprint(destDir) : '';
+        const backupFingerprint = hasBackup ? computePackageFingerprint(backupDir) : '';
+        const committedFingerprint = dbPlugin.packageFingerprint;
+
+        // Check if DB committed the update
+        const isCommitted = Boolean(
+          committedFingerprint &&
+          journal?.toFingerprint &&
+          committedFingerprint === journal.toFingerprint
+        );
+
+        if (isCommitted) {
+          // Update successfully committed to database
+          if (hasDest && destFingerprint === committedFingerprint) {
+            if (hasBackup) rmSync(backupDir, { recursive: true, force: true });
+            if (hasJournal) rmSync(journalPath, { force: true });
+          } else if (hasBackup && backupFingerprint === committedFingerprint) {
+            if (hasDest) rmSync(destDir, { recursive: true, force: true });
+            renameSync(backupDir, destDir);
+            if (hasJournal) rmSync(journalPath, { force: true });
+          }
+          continue;
+        }
+
+        // Database did NOT commit the update (pre-commit interruption or rollback)
+        if (!hasBackup) {
+          // No backup exists
+          if (hasDest) {
+            // Destination is the only copy on disk.
+            const matchesCommitted = committedFingerprint
+              ? destFingerprint === committedFingerprint
+              : (journal?.fromFingerprint ? destFingerprint === journal.fromFingerprint : true);
+
+            if (matchesCommitted) {
+              // Pre-swap interruption: dest is the known-good original package.
+              // Never delete it; retain it and discard the abandoned journal.
+              if (hasJournal) rmSync(journalPath, { force: true });
+            } else {
+              // Ambiguous/corrupt state: dest differs from committed and no backup exists.
+              // Preserve dest and journal for diagnosis rather than destroying files.
+            }
+          }
+          continue;
+        }
+
+        // Backup exists and DB did not commit
+        if (!hasDest) {
+          // Interrupted while dest was backed up before staging moved into place
+          renameSync(backupDir, destDir);
+          if (hasJournal) rmSync(journalPath, { force: true });
+          continue;
+        }
+
+        // Both destination and backup exist, and update did not commit
+        if (destFingerprint && committedFingerprint && destFingerprint === committedFingerprint) {
+          // Destination already matches committed fingerprint; backup is stale
+          rmSync(backupDir, { recursive: true, force: true });
+          if (hasJournal) rmSync(journalPath, { force: true });
+        } else {
+          // Destination has uncommitted changes or differs from committed state.
+          // Restore backup to destination!
+          rmSync(destDir, { recursive: true, force: true });
+          renameSync(backupDir, destDir);
+          if (hasJournal) rmSync(journalPath, { force: true });
         }
       }
     } catch {}
@@ -631,7 +667,7 @@ export class PluginService {
         journalPath,
         JSON.stringify({
           pluginId: existing.id,
-          stage: 'swapping',
+          stage: 'prepared',
           fromFingerprint,
           toFingerprint,
           timestamp: Date.now(),
@@ -643,9 +679,29 @@ export class PluginService {
       }
       if (existsSync(dest)) {
         renameSync(dest, backup);
+        writeFileSync(
+          journalPath,
+          JSON.stringify({
+            pluginId: existing.id,
+            stage: 'backed_up',
+            fromFingerprint,
+            toFingerprint,
+            timestamp: Date.now(),
+          }),
+        );
       }
       renameSync(staging, dest);
       swapped = true;
+      writeFileSync(
+        journalPath,
+        JSON.stringify({
+          pluginId: existing.id,
+          stage: 'installed',
+          fromFingerprint,
+          toFingerprint,
+          timestamp: Date.now(),
+        }),
+      );
 
       this.store.updatePluginAndServices(
         existing.id,

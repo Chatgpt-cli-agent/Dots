@@ -17,7 +17,11 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { WorkspaceStore } from '../src/server/workspace.js';
 import { Store } from '../src/server/store.js';
 import { Platform } from '../src/server/platform.js';
-import { PluginService, PluginError } from '../src/server/plugin-service.js';
+import {
+  PluginService,
+  PluginError,
+  computePackageFingerprint,
+} from '../src/server/plugin-service.js';
 import { pluginRoutes } from '../src/server/plugin-routes.js';
 import {
   ConnectionService,
@@ -940,7 +944,7 @@ it('Scenario 12: Atomic rollback on failure injection during update and initial 
   expect(h.platform.plugins.list().some((item) => item.name === 'install-fail-pack')).toBe(false);
 });
 
-it('Scenario 13: Interrupted update recovery on restart via recoverStaleState, including same-version replacement', async () => {
+it('Scenario 13: Interrupted update recovery on restart via recoverStaleState, including same-version replacement and pre-swap journal', async () => {
   const h = createTestHarness();
   const pDir = h.createPluginFolder('interrupted-pack', {
     version: '1.0.0',
@@ -950,6 +954,7 @@ it('Scenario 13: Interrupted update recovery on restart via recoverStaleState, i
   const pluginRoot = (h.platform.plugins as any).root;
   const destDir = path.join(pluginRoot, p.id);
   const backupDir = path.join(pluginRoot, `backup-${p.id}`);
+  const journalPath = path.join(pluginRoot, `journal-${p.id}.json`);
 
   // Test Case A: Interrupted update where DB did not commit (version 2.0.0):
   // 1. dest has v2.0.0 files
@@ -977,7 +982,35 @@ it('Scenario 13: Interrupted update recovery on restart via recoverStaleState, i
   // Backup folder should be gone
   expect(existsSync(backupDir)).toBe(false);
 
-  // Test Case B: SAME-VERSION interrupted update before DB commit:
+  // Test Case B: PRE-SWAP INTERRUPTION (journal written, dest untouched, no backup):
+  // Destination contains the valid committed package. Recovery must NOT delete it!
+  const installedFingerprint = p.packageFingerprint;
+  writeFileSync(
+    journalPath,
+    JSON.stringify({
+      pluginId: p.id,
+      stage: 'prepared',
+      fromFingerprint: installedFingerprint,
+      toFingerprint: 'different-fingerprint-intended-to-be-swapped',
+      timestamp: Date.now(),
+    }),
+  );
+  // Ensure no backup directory exists
+  if (existsSync(backupDir)) rmSync(backupDir, { recursive: true, force: true });
+  // Dest is untouched
+  expect(existsSync(destDir)).toBe(true);
+
+  new PluginService(h.workspace.plugins, pluginRoot);
+  // Destination MUST still exist and contain the original committed package!
+  expect(existsSync(destDir)).toBe(true);
+  const preSwapSkill = readFileSync(path.join(destDir, 'skills', 'helper', 'SKILL.md'), 'utf8');
+  expect(preSwapSkill).toContain('Help instructions');
+  // Stale pre-swap journal must be cleaned up
+  expect(existsSync(journalPath)).toBe(false);
+  // Registry entry must remain valid
+  expect(h.platform.plugins.list().some((item) => item.id === p.id)).toBe(true);
+
+  // Test Case C: SAME-VERSION interrupted update before DB commit:
   // Both old and new files use version "1.0.0", but dest has uncommitted changes
   renameSync(destDir, backupDir);
   mkdirSync(destDir, { recursive: true });
@@ -999,14 +1032,68 @@ it('Scenario 13: Interrupted update recovery on restart via recoverStaleState, i
   expect(restoredSameVerSkill).not.toContain('Uncommitted');
   expect(existsSync(backupDir)).toBe(false);
 
-  // Test Case C: Interrupted update where DB did commit but backup folder wasn't deleted:
-  // DB committed current dest content, stale backup exists
+  // Test Case D: Interrupted update where DB did commit but backup/journal wasn't deleted:
+  // DB committed current dest content, stale backup & journal exist
   mkdirSync(backupDir, { recursive: true });
   writeFileSync(path.join(backupDir, 'stale.txt'), 'stale');
+  writeFileSync(
+    journalPath,
+    JSON.stringify({
+      pluginId: p.id,
+      stage: 'installed',
+      fromFingerprint: 'old-fp',
+      toFingerprint: installedFingerprint,
+      timestamp: Date.now(),
+    }),
+  );
 
   new PluginService(h.workspace.plugins, pluginRoot);
   expect(existsSync(backupDir)).toBe(false);
+  expect(existsSync(journalPath)).toBe(false);
   expect(existsSync(destDir)).toBe(true);
+
+  // Test Case E: Legacy record without packageFingerprint in DB:
+  // If dest matches fromFingerprint in journal and no backup exists, dest is retained
+  const legacyPlugin = { ...p, id: 'legacy-id-123', name: 'legacy-pack', packageFingerprint: undefined };
+  (h.workspace.plugins as any).add(legacyPlugin);
+  const legacyDest = path.join(pluginRoot, 'legacy-id-123');
+  mkdirSync(legacyDest, { recursive: true });
+  writeFileSync(
+    path.join(legacyDest, 'plugin.json'),
+    JSON.stringify({ name: 'legacy-pack', version: '1.0.0', description: 'legacy' }),
+  );
+  const legacyJournal = path.join(pluginRoot, 'journal-legacy-id-123.json');
+  const legacyFp = computePackageFingerprint(legacyDest);
+  writeFileSync(
+    legacyJournal,
+    JSON.stringify({
+      pluginId: 'legacy-id-123',
+      stage: 'prepared',
+      fromFingerprint: legacyFp,
+      toFingerprint: 'new-fp',
+    }),
+  );
+
+  new PluginService(h.workspace.plugins, pluginRoot);
+  expect(existsSync(legacyDest)).toBe(true);
+  expect(existsSync(legacyJournal)).toBe(false);
+
+  // Test Case F: Ambiguous corrupt state preservation:
+  // No backup exists, dest does not match committed fingerprint and does not match fromFingerprint
+  writeFileSync(
+    legacyJournal,
+    JSON.stringify({
+      pluginId: 'legacy-id-123',
+      stage: 'unknown',
+      fromFingerprint: 'mismatched-from',
+      toFingerprint: 'mismatched-to',
+    }),
+  );
+  new PluginService(h.workspace.plugins, pluginRoot);
+  // Ambiguous state preserved for diagnosis rather than deleting files
+  expect(existsSync(legacyDest)).toBe(true);
+  expect(existsSync(legacyJournal)).toBe(true);
+  rmSync(legacyJournal, { force: true });
 });
 
 it('Scenario 14: In-flight execution cancellation and rejection on disable/unassign', async () => {
