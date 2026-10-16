@@ -50,6 +50,8 @@ Plugins can declare remote MCP services under `mcpServers` using HTTP/HTTPS endp
 - **Tool Resolution & Collision Safety**: Tools exposed to Dots are named deterministically as `plugin__<plugin>__<service>__<tool>`. Names are normalized, truncated, and deduplicated with numeric suffixes to fit within 64-character tool limits.
 - **Approvals**: Non-read-only tools require owner approval by default. Approvals bind to the specific service and arguments rather than ephemeral tool names.
 
+Pending approval cards return when you reopen a conversation after a server restart. Their saved tool calls resume with the owner's approval or decline as a tool result. Reopening the chat does not execute the action; an invalid approval identifier cannot authorize it.
+
 ## Updates, Rollback, and Recovery
 
 - **Atomic Directory and Database Updates**: Plugin updates stage files and verify schemas before replacing installed assets. Directory swaps and SQLite persistence are coordinated; if database persistence fails, the filesystem and database atomically roll back to the previous version.

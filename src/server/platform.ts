@@ -133,19 +133,8 @@ export class Platform {
           ),
         ]);
       }
-      for (const thread of workspace.conversations()) {
-        entries.push([
-          `chat-${thread.id}`,
-          new DotAgent(
-            store,
-            workspace,
-            config,
-            thread.dotId,
-            false,
-            this.setupTelemetry,
-          ),
-        ]);
-      }
+      // Chat creates a private local proxy per thread, routed to its Dot.
+      // Publishing those proxy IDs here collides with registration after reload.
       return Object.fromEntries(entries);
     };
     const nativeRunner = new NativeAgentRunner({

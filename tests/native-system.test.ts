@@ -5,7 +5,7 @@ import { Store } from '../src/server/store.js';
 import { WorkspaceStore } from '../src/server/workspace.js';
 import { Platform } from '../src/server/platform.js';
 import { ComputerService } from '../src/server/computer-service.js';
-import { EventType, MessagesSnapshotEventSchema, RunFinishedEventSchema } from '@ag-ui/core';
+import { EventType, MessagesSnapshotEventSchema } from '@ag-ui/core';
 import { lastValueFrom, toArray, Observable } from 'rxjs';
 import { ProtocolAccumulator } from '../src/server/protocol-accumulator.js';
 import { NativeAgentRunner } from '../src/server/native-runner.js';
@@ -474,17 +474,9 @@ it('reconnects and replays durable SQLite history and pending approvals via Nati
   });
   expect(MessagesSnapshotEventSchema.safeParse(snapshotEvent).success).toBe(true);
 
-  // 2. Pending approval interrupt event emitted and validates against AG-UI schema
-  const interruptEvent = events.find(
-    (e: any) => e.type === EventType.RUN_FINISHED && e.outcome?.type === 'interrupt',
-  ) as any;
-  expect(interruptEvent).toBeDefined();
-  expect(interruptEvent.outcome.interrupts[0]).toMatchObject({
-    id: 'exec-approval-1',
-    name: 'request_connection_action',
-    toolCallId: 'call-deploy-1',
-  });
-  expect(RunFinishedEventSchema.safeParse(interruptEvent).success).toBe(true);
+  // Frontend approvals resume with tool results, not standard interrupt payloads.
+  expect(events.some((e: any) => e.outcome?.type === 'interrupt')).toBe(false);
+  expect(workspace2.getToolExecution('exec-approval-1')?.status).toBe('awaiting_approval');
 });
 
 it('coordinates atomic run cancellation and guards against terminal status overwrites', () => {
@@ -814,9 +806,8 @@ it('tracks frontend review tool approvals without interrupt outcome and restores
   expect(MessagesSnapshotEventSchema.safeParse(snapshot).success).toBe(true);
 
   const interrupt = replayed.find((e: any) => e.type === EventType.RUN_FINISHED && e.outcome?.type === 'interrupt') as any;
-  expect(interrupt).toBeDefined();
-  expect(RunFinishedEventSchema.safeParse(interrupt).success).toBe(true);
-  expect(interrupt.outcome.interrupts[0].toolCallId).toBe(toolCallId);
+  expect(interrupt).toBeUndefined();
+  expect(snapshot.messages.some((m: any) => m.toolCalls?.some((c: any) => c.id === toolCallId))).toBe(true);
 
   // 4. Continue execution with approval result submitted via input transcript (no manual DB status edits)
   const pageResult = workspace.pages.createReviewed(
@@ -962,7 +953,7 @@ it('tracks frontend review tool decline and resolves durable execution without d
   expect(reviewExec?.status).toBe('awaiting_approval');
   expect(reviewExec?.approved).toBe(false);
 
-  // Fresh runner connect reproduces interrupt before user response
+  // Reconnect restores the tool call without requiring a standard interrupt resume.
   const runner = new NativeAgentRunner({ workspace });
   const initialReconnect = await lastValueFrom(
     runner.connect({ threadId: thread.id }).pipe(toArray()),
@@ -970,7 +961,7 @@ it('tracks frontend review tool decline and resolves durable execution without d
   const initialInterrupt = initialReconnect.find(
     (e: any) => e.type === EventType.RUN_FINISHED && e.outcome?.type === 'interrupt',
   );
-  expect(initialInterrupt).toBeDefined();
+  expect(initialInterrupt).toBeUndefined();
 
   // User declines approval - sent into continuation run without manually editing DB
   const continuationRunId = 'run-decline-continuation-1';
