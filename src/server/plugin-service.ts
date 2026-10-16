@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   cpSync,
   existsSync,
@@ -24,6 +24,25 @@ import type { SkillInfo } from './skills-service.js';
 import type { ConnectionService } from './connections.js';
 
 export class PluginError extends Error {}
+
+export function computePackageFingerprint(
+  manifest: { name: string; version: string; description: string; skills?: any },
+  services: PluginServiceDeclaration[],
+  skills: InstalledPlugin['skills'],
+): string {
+  const payload = JSON.stringify({
+    name: manifest.name,
+    version: manifest.version,
+    description: manifest.description,
+    skills: skills.map((s) => ({ name: s.name, directory: s.directory })),
+    services: services.map((s) => ({
+      name: s.name,
+      url: s.url,
+      requiresToken: s.requiresToken,
+    })),
+  });
+  return createHash('sha256').update(payload).digest('hex');
+}
 
 const manifestSchema = z
   .object({
@@ -216,6 +235,58 @@ export class PluginService {
     connectionService?: ConnectionService,
   ) {
     this.connectionService = connectionService;
+    this.recoverStaleState();
+  }
+
+  recoverStaleState() {
+    try {
+      const rootPath = path.resolve(this.root);
+      if (!existsSync(rootPath)) return;
+      const entries = readdirSync(rootPath, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        if (entry.name.startsWith('staging-')) {
+          rmSync(path.join(rootPath, entry.name), {
+            recursive: true,
+            force: true,
+          });
+        } else if (entry.name.startsWith('backup-')) {
+          const pluginId = entry.name.replace(/^backup-/, '');
+          const backupDir = path.join(rootPath, entry.name);
+          const destDir = path.join(rootPath, pluginId);
+          const dbPlugin = this.store.list().find((p) => p.id === pluginId);
+          if (!dbPlugin) {
+            rmSync(backupDir, { recursive: true, force: true });
+            continue;
+          }
+          if (!existsSync(destDir)) {
+            renameSync(backupDir, destDir);
+            continue;
+          }
+          let destMatches = false;
+          try {
+            const manifestPath = existsSync(
+              path.join(destDir, '.codex-plugin', 'plugin.json'),
+            )
+              ? path.join(destDir, '.codex-plugin', 'plugin.json')
+              : path.join(destDir, 'plugin.json');
+            if (existsSync(manifestPath)) {
+              const parsed = JSON.parse(readFileSync(manifestPath, 'utf8'));
+              if (parsed.version === dbPlugin.version) {
+                destMatches = true;
+              }
+            }
+          } catch {}
+
+          if (destMatches) {
+            rmSync(backupDir, { recursive: true, force: true });
+          } else {
+            rmSync(destDir, { recursive: true, force: true });
+            renameSync(backupDir, destDir);
+          }
+        }
+      }
+    } catch {}
   }
 
   setConnectionService(connectionService: ConnectionService) {
@@ -233,7 +304,9 @@ export class PluginService {
   }
 
   private folder(id: string) {
-    if (!/^[0-9a-f-]{36}|staging-[0-9a-f-]{36}|backup-[0-9a-f-]{36}$/.test(id))
+    if (
+      !/^([0-9a-f-]{36}|staging-[0-9a-f-]{36}|backup-[0-9a-f-]{36})$/.test(id)
+    )
       throw new PluginError('Invalid plugin ID.');
     return path.resolve(this.root, id);
   }
@@ -302,6 +375,48 @@ export class PluginService {
       );
 
     const existing = this.list().find((p) => p.name === manifest.name);
+    const requiredConfiguration: string[] = [];
+    if (existing) {
+      for (const service of services) {
+        const existingService = existing.services.find(
+          (s) => s.name === service.name,
+        );
+        if (existingService) {
+          const urlChanged = existingService.url !== service.url;
+          const authChanged =
+            Boolean(existingService.requiresToken) !==
+            Boolean(service.requiresToken);
+          if (urlChanged || authChanged) {
+            requiredConfiguration.push(
+              `Service "${service.name}" endpoint or authentication changed; credentials and permissions will reset on update.`,
+            );
+          } else if (service.requiresToken && !existingService.hasToken) {
+            requiredConfiguration.push(
+              `Service "${service.name}" requires an API token.`,
+            );
+          }
+        } else if (service.requiresToken) {
+          requiredConfiguration.push(
+            `Service "${service.name}" requires an API token.`,
+          );
+        }
+      }
+    } else {
+      for (const service of services) {
+        if (service.requiresToken) {
+          requiredConfiguration.push(
+            `Service "${service.name}" requires an API token.`,
+          );
+        }
+      }
+    }
+
+    const packageFingerprint = computePackageFingerprint(
+      manifest,
+      services,
+      skills,
+    );
+
     return {
       name: manifest.name,
       version: manifest.version,
@@ -313,11 +428,10 @@ export class PluginService {
         description: s.description,
         requiresToken: s.requiresToken,
       })),
-      requiredConfiguration: services
-        .filter((s) => s.requiresToken)
-        .map((s) => `Service "${s.name}" requires an API token.`),
+      requiredConfiguration,
       isUpdate: Boolean(existing),
       existingVersion: existing?.version,
+      packageFingerprint,
     };
   }
 
@@ -378,10 +492,7 @@ export class PluginService {
         dotIds: [],
         services: [],
       };
-      this.store.add(plugin);
-      for (const s of services) {
-        this.store.upsertService(plugin.id, s);
-      }
+      this.store.addPluginWithServices(plugin, services);
       return this.require(plugin.id);
     } catch (error) {
       if (existsSync(staging)) rmSync(staging, { recursive: true, force: true });
@@ -392,11 +503,16 @@ export class PluginService {
     }
   }
 
-  update(id: string, source: string): InstalledPlugin {
+  update(
+    id: string,
+    source: string,
+    options?: { expectedVersion?: string; expectedFingerprint?: string },
+  ): InstalledPlugin {
     const existing = this.require(id);
     const staging = this.folder(`staging-${randomUUID()}`);
-    const backup = this.folder(`backup-${randomUUID()}`);
+    const backup = this.folder(`backup-${existing.id}`);
     const dest = this.folder(existing.id);
+    let swapped = false;
     try {
       const sourceRoot = realpathSync(source);
       if (!lstatSync(sourceRoot).isDirectory())
@@ -442,47 +558,65 @@ export class PluginService {
           'Plugin must declare at least one skill or MCP service.',
         );
 
+      if (
+        options?.expectedVersion &&
+        manifest.version !== options.expectedVersion
+      ) {
+        throw new PluginError(
+          `Package version changed from ${options.expectedVersion} to ${manifest.version} since preview.`,
+        );
+      }
+      if (options?.expectedFingerprint) {
+        const fingerprint = computePackageFingerprint(
+          manifest,
+          services,
+          skills,
+        );
+        if (fingerprint !== options.expectedFingerprint) {
+          throw new PluginError('Package contents changed since preview.');
+        }
+      }
+
+      if (existsSync(backup)) {
+        rmSync(backup, { recursive: true, force: true });
+      }
       if (existsSync(dest)) {
         renameSync(dest, backup);
       }
-      try {
-        renameSync(staging, dest);
-      } catch (err) {
-        if (existsSync(backup) && !existsSync(dest)) {
-          renameSync(backup, dest);
-        }
-        throw err;
-      }
+      renameSync(staging, dest);
+      swapped = true;
+
+      this.store.updatePluginAndServices(
+        existing.id,
+        {
+          id: existing.id,
+          name: manifest.name,
+          version: manifest.version,
+          description: manifest.description,
+          installedAt: existing.installedAt,
+          skills,
+        },
+        services,
+      );
+
       if (existsSync(backup)) {
         rmSync(backup, { recursive: true, force: true });
       }
 
-      this.store.updateManifest(existing.id, {
-        id: existing.id,
-        name: manifest.name,
-        version: manifest.version,
-        description: manifest.description,
-        installedAt: existing.installedAt,
-        skills,
-      });
-
-      for (const s of services) {
-        this.store.upsertService(existing.id, s);
-      }
-      this.store.deleteServicesExcept(
-        existing.id,
-        services.map((s) => s.name),
-      );
-
       return this.require(existing.id);
     } catch (error) {
-      if (existsSync(staging)) rmSync(staging, { recursive: true, force: true });
-      if (existsSync(backup)) {
-        if (!existsSync(dest)) {
-          renameSync(backup, dest);
-        } else {
-          rmSync(backup, { recursive: true, force: true });
+      if (swapped) {
+        if (existsSync(dest)) {
+          rmSync(dest, { recursive: true, force: true });
         }
+        if (existsSync(backup)) {
+          renameSync(backup, dest);
+        }
+      } else if (existsSync(backup) && !existsSync(dest)) {
+        renameSync(backup, dest);
+      }
+      if (existsSync(staging)) {
+        rmSync(staging, { recursive: true, force: true });
       }
       if (error instanceof PluginError) throw error;
       throw new PluginError(

@@ -103,7 +103,31 @@ export function exposedTools(connections: Connection[]): ExposedTool[] {
     )
     .filter(({ tool }) => tool.enabled);
 }
-export function normalizeResult(result: unknown): ConnectionActionResult {
+export function scrubCredentials(
+  text: string,
+  secrets: (string | undefined | null)[],
+): string {
+  if (!text) return text;
+  let out = text;
+  for (const secret of secrets) {
+    if (!secret || typeof secret !== 'string') continue;
+    const cleanSecret = secret.trim();
+    if (cleanSecret.length < 3) continue;
+    out = out.split(cleanSecret).join('[REDACTED]');
+    try {
+      const encoded = encodeURIComponent(cleanSecret);
+      if (encoded !== cleanSecret) {
+        out = out.split(encoded).join('[REDACTED]');
+      }
+    } catch {}
+  }
+  return out;
+}
+
+export function normalizeResult(
+  result: unknown,
+  secret?: string,
+): ConnectionActionResult {
   const envelope = z
     .object({
       isError: z.boolean().optional(),
@@ -128,7 +152,10 @@ export function normalizeResult(result: unknown): ConnectionActionResult {
   );
   if (!parts.some((part) => part.trim()) && envelope.data.structuredContent)
     parts.push(JSON.stringify(envelope.data.structuredContent));
-  const text = parts.join('\n').trim() || '(no content)';
+  let text = parts.join('\n').trim() || '(no content)';
+  if (secret) {
+    text = scrubCredentials(text, [secret]);
+  }
   return {
     isError: !!envelope.data.isError,
     text:
@@ -137,21 +164,27 @@ export function normalizeResult(result: unknown): ConnectionActionResult {
         : text,
   };
 }
-const failure = (error: unknown) => {
+
+const failure = (error: unknown, secret?: string) => {
+  let message: string;
   if (!(error instanceof Error))
-    return 'Could not reach the connected service.';
-  if (error.name === 'AbortError' || error.name === 'TimeoutError')
-    return 'The connected service did not respond in time.';
-  const status = (error as { code?: unknown }).code;
-  // OAuth-only servers surface UnauthorizedError when no token is supplied.
-  if (
-    status === 401 ||
-    status === 403 ||
-    error.name === 'UnauthorizedError' ||
-    error.constructor.name === 'UnauthorizedError'
-  )
-    return 'The connected service rejected the credentials. Check the bearer token.';
-  return `Could not reach the connected service${error.message ? `: ${error.message.slice(0, 200)}` : '.'}`;
+    message = 'Could not reach the connected service.';
+  else if (error.name === 'AbortError' || error.name === 'TimeoutError')
+    message = 'The connected service did not respond in time.';
+  else {
+    const status = (error as { code?: unknown }).code;
+    // OAuth-only servers surface UnauthorizedError when no token is supplied.
+    if (
+      status === 401 ||
+      status === 403 ||
+      error.name === 'UnauthorizedError' ||
+      error.constructor.name === 'UnauthorizedError'
+    )
+      message = 'The connected service rejected the credentials. Check the bearer token.';
+    else
+      message = `Could not reach the connected service${error.message ? `: ${error.message.slice(0, 200)}` : '.'}`;
+  }
+  return secret ? scrubCredentials(message, [secret]) : message;
 };
 export class ConnectionService {
   constructor(
@@ -198,15 +231,24 @@ export class ConnectionService {
           const parsed = listedTool.safeParse(raw);
           if (!parsed.success || tools.length >= MAX_TOOLS) continue;
           const tool = parsed.data;
-          if (JSON.stringify(tool.inputSchema).length > MAX_SCHEMA_BYTES)
-            continue;
+          const rawSchema = JSON.stringify(tool.inputSchema);
+          const safeSchema = target.token
+            ? scrubCredentials(rawSchema, [target.token])
+            : rawSchema;
+          if (safeSchema.length > MAX_SCHEMA_BYTES) continue;
           const readOnly = tool.annotations?.readOnlyHint === true;
           const prior = previous.find((item) => item.name === tool.name);
+          const rawTitle = tool.title ?? tool.annotations?.title ?? tool.name;
+          const rawDesc = (tool.description ?? '').slice(0, 1000);
           tools.push({
             name: tool.name,
-            title: tool.title ?? tool.annotations?.title ?? tool.name,
-            description: (tool.description ?? '').slice(0, 1000),
-            inputSchema: { type: 'object', ...tool.inputSchema },
+            title: target.token
+              ? scrubCredentials(rawTitle, [target.token])
+              : rawTitle,
+            description: target.token
+              ? scrubCredentials(rawDesc, [target.token])
+              : rawDesc,
+            inputSchema: { type: 'object', ...JSON.parse(safeSchema) },
             readOnly,
             // New tools start enabled; anything not read-only needs approval.
             enabled: prior?.enabled ?? true,
@@ -224,15 +266,16 @@ export class ConnectionService {
     try {
       tools = await this.discover({ url: value.url, token: value.token });
     } catch (error) {
-      throw new Error(failure(error), { cause: error });
+      throw new Error(failure(error, value.token), { cause: error });
     }
     return this.store.create(dotId, value, tools);
   }
   async refresh(id: string) {
     const connection = this.store.get(id);
     if (!connection) throw new Error('Connection not found.');
+    const creds = this.store.credentials(id);
     try {
-      const discovered = await this.discover(this.store.credentials(id));
+      const discovered = await this.discover(creds);
       // Owner changes made while discovery ran win: merge against the
       // settings as they are now, not as they were when it started.
       const current = this.store.get(id);
@@ -251,7 +294,7 @@ export class ConnectionService {
         }),
       );
     } catch (error) {
-      return this.store.setError(id, failure(error));
+      return this.store.setError(id, failure(error, creds.token));
     }
   }
   setTool(
@@ -323,8 +366,8 @@ export class ConnectionService {
     args: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<ConnectionActionResult> {
+    let credentials: { url: string; token?: string } | undefined;
     try {
-      let credentials: { url: string; token?: string };
       if (exposed.connection.id.startsWith('plugin:')) {
         const parts = exposed.connection.id.split(':');
         const pluginId = parts[1];
@@ -352,10 +395,11 @@ export class ConnectionService {
               undefined,
               { signal: bounded },
             ),
+            credentials!.token,
           ),
       );
     } catch (error) {
-      return { isError: true, text: failure(error) };
+      return { isError: true, text: failure(error, credentials?.token) };
     }
   }
 
@@ -370,8 +414,12 @@ export class ConnectionService {
     if (!this.pluginStore) throw new Error('Plugin store not configured.');
     const service = this.pluginStore.getService(pluginId, serviceName);
     if (!service) throw new Error('Plugin service not found.');
+    let credentials: { url: string; token?: string } | undefined;
     try {
-      const credentials = this.pluginStore.getServiceCredentials(pluginId, serviceName);
+      credentials = this.pluginStore.getServiceCredentials(
+        pluginId,
+        serviceName,
+      );
       if (!credentials) throw new Error('Plugin service credentials not found.');
       if (service.requiresToken && !credentials.token) {
         return this.pluginStore.setServiceTools(
@@ -393,7 +441,7 @@ export class ConnectionService {
         pluginId,
         serviceName,
         service.tools,
-        failure(error),
+        failure(error, credentials?.token),
       );
     }
   }

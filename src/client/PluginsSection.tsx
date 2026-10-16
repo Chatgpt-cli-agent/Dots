@@ -182,6 +182,8 @@ export function PluginsSection({
                     void change(() =>
                       api(`/plugins/${existingPlugin.id}/update`, 'POST', {
                         path: targetPath,
+                        expectedVersion: preview.version,
+                        expectedFingerprint: preview.packageFingerprint,
                       }),
                     );
                   }

@@ -82,18 +82,32 @@ export class PluginStore {
       .get(pluginId, service.name) as any;
     const now = Date.now();
     if (existing) {
-      this.db
-        .prepare(
-          'UPDATE plugin_services SET url=?, description=?, requiresToken=?, updatedAt=? WHERE pluginId=? AND serviceName=?',
-        )
-        .run(
-          service.url,
-          service.description ?? null,
-          service.requiresToken ? 1 : 0,
-          now,
-          pluginId,
-          service.name,
-        );
+      const urlChanged = String(existing.url) !== service.url;
+      const authChanged =
+        Boolean(existing.requiresToken) !== Boolean(service.requiresToken);
+      if (urlChanged || authChanged) {
+        // Endpoint or auth changed: reset credentials and cached policy, disable service
+        this.db
+          .prepare(
+            'UPDATE plugin_services SET url=?, description=?, requiresToken=?, token=NULL, enabled=0, tools=?, error=NULL, updatedAt=? WHERE pluginId=? AND serviceName=?',
+          )
+          .run(
+            service.url,
+            service.description ?? null,
+            service.requiresToken ? 1 : 0,
+            '[]',
+            now,
+            pluginId,
+            service.name,
+          );
+      } else {
+        // Unchanged endpoint identity: preserve token, enabled, tools, error
+        this.db
+          .prepare(
+            'UPDATE plugin_services SET description=?, updatedAt=? WHERE pluginId=? AND serviceName=?',
+          )
+          .run(service.description ?? null, now, pluginId, service.name);
+      }
     } else {
       this.db
         .prepare(
@@ -206,17 +220,64 @@ export class PluginStore {
   }
 
   add(plugin: InstalledPlugin) {
-    this.db
-      .prepare('INSERT INTO plugins(id,name,manifest) VALUES (?,?,?)')
-      .run(plugin.id, plugin.name, JSON.stringify(plugin));
-    if (plugin.services && plugin.services.length) {
-      for (const s of plugin.services) {
+    this.addPluginWithServices(plugin, plugin.services ?? []);
+  }
+
+  addPluginWithServices(
+    plugin: InstalledPlugin,
+    services: {
+      name: string;
+      url: string;
+      description?: string;
+      requiresToken?: boolean;
+    }[],
+  ) {
+    this.db.exec('BEGIN');
+    try {
+      this.db
+        .prepare('INSERT INTO plugins(id,name,manifest) VALUES (?,?,?)')
+        .run(plugin.id, plugin.name, JSON.stringify(plugin));
+      for (const s of services) {
         this.upsertService(plugin.id, s);
       }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
     }
   }
 
-  updateManifest(id: string, manifest: Omit<InstalledPlugin, 'enabled' | 'dotIds' | 'services'>) {
+  updatePluginAndServices(
+    id: string,
+    manifest: Omit<InstalledPlugin, 'enabled' | 'dotIds' | 'services'>,
+    services: {
+      name: string;
+      url: string;
+      description?: string;
+      requiresToken?: boolean;
+    }[],
+  ) {
+    this.db.exec('BEGIN');
+    try {
+      this.updateManifest(id, manifest);
+      for (const s of services) {
+        this.upsertService(id, s);
+      }
+      this.deleteServicesExcept(
+        id,
+        services.map((s) => s.name),
+      );
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  updateManifest(
+    id: string,
+    manifest: Omit<InstalledPlugin, 'enabled' | 'dotIds' | 'services'>,
+  ) {
     this.db
       .prepare('UPDATE plugins SET manifest=? WHERE id=?')
       .run(JSON.stringify(manifest), id);

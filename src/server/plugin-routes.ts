@@ -39,10 +39,25 @@ export function pluginRoutes(platform: Platform) {
         : typeof json?.source === 'string'
           ? json.source
           : '';
-    const input = z.string().trim().min(1).max(4096).safeParse(pathVal);
+    const input = z
+      .object({
+        path: z.string().trim().min(1).max(4096),
+        expectedVersion: z.string().trim().min(1).max(80).optional(),
+        expectedFingerprint: z.string().trim().length(64).optional(),
+      })
+      .safeParse({
+        path: pathVal,
+        expectedVersion: json?.expectedVersion,
+        expectedFingerprint: json?.expectedFingerprint,
+      });
     if (!input.success)
       return c.json({ error: 'Enter a local plugin folder path.' }, 400);
-    return c.json(platform.plugins.update(c.req.param('id'), input.data));
+    return c.json(
+      platform.plugins.update(c.req.param('id'), input.data.path, {
+        expectedVersion: input.data.expectedVersion,
+        expectedFingerprint: input.data.expectedFingerprint,
+      }),
+    );
   });
 
   app.patch('/plugins/:id', async (c) => {

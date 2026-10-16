@@ -45,5 +45,6 @@ export interface PluginPreview {
   requiredConfiguration: string[];
   isUpdate: boolean;
   existingVersion?: string;
+  packageFingerprint: string;
 }
 
