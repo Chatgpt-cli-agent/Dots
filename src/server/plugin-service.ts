@@ -716,15 +716,6 @@ export class PluginService {
         },
         services,
       );
-
-      if (existsSync(backup)) {
-        rmSync(backup, { recursive: true, force: true });
-      }
-      if (existsSync(journalPath)) {
-        rmSync(journalPath, { force: true });
-      }
-
-      return this.require(existing.id);
     } catch (error) {
       if (swapped) {
         if (existsSync(dest)) {
@@ -745,8 +736,25 @@ export class PluginService {
       if (error instanceof PluginError) throw error;
       throw new PluginError(
         'Could not update this plugin. Check its manifest and readable files.',
+        { cause: error },
       );
     }
+
+    // The database has committed: the new directory is now authoritative.
+    // Cleanup failures must never enter the pre-commit rollback above, since
+    // the backup may already be partly deleted. Retain the journal until all
+    // cleanup succeeds so recovery can retry without changing the installation.
+    try {
+      if (existsSync(backup)) {
+        rmSync(backup, { recursive: true, force: true });
+      }
+      if (existsSync(journalPath)) {
+        rmSync(journalPath, { force: true });
+      }
+    } catch {
+      // recoverStaleState verifies the committed content before retrying.
+    }
+    return this.require(existing.id);
   }
 
   enable(id: string, enabled: boolean) {

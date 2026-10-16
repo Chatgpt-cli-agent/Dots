@@ -1,5 +1,7 @@
 # Local plugins
 
+After an update commits, the installed package and database stay on the new version even if removing the old backup fails. The update journal is retained so recovery can retry cleanup later. Cleanup failures do not roll a committed update back to an older package.
+
 Dots can install local packages of skills, reference files, and MCP tool connections. Existing standalone skills continue to work through the configured skills directory, and direct Dot Connections remain fully supported. A plugin does not change the model or grant unauthorized computer access.
 
 The restored standalone library lives in the repository's `skills/` folder and is the default. `SKILLS_PATH`, `SKILLS_DIR`, or `OPENDOTS_SKILLS_PATH` can select another directory. The legacy `GALAXYONE_SKILLS_PATH` setting is still accepted as an explicit override; you do not need GalaxyOne to use the bundled library. Dots does not move or delete the standalone directory during plugin operations. Skill packages' own tests remain resources; the Dots test runner discovers application tests under `tests/` only.
